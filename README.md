@@ -18,6 +18,11 @@ delete-one-seventh bootstrap. Here the `n-1`-agreement fusion rule is isolated a
 six existing heterogeneous base learners; the DNN architecture and the bootstrap construction are
 not reproduced.
 
+**Headline result, over 70 split seeds: pre-filtering does not beat standard stacking on this
+dataset.** It is slightly but consistently *worse* (mean −0.0012 balanced accuracy, losing on 42 of
+70 seeds), while beating standalone XGBoost and plain hard voting by small margins. Full numbers,
+including the paired tests, are in [Results](#results) below.
+
 ## Contents
 
 | Path | Description |
@@ -88,25 +93,82 @@ Written to `prefilter_seed_results/`, keyed by `configuration_id`:
 - `plots/<configuration_id>/` — cross-seed comparison plots, plus `diagnostics/` for base-learner
   distributions, pairwise-diversity heatmaps and per-route performance.
 
-## Reference run
+## Results
 
-`prefilter_seed_results/` holds one committed run at `split_seed = 700`. Test-set balanced accuracy:
+Evaluated over **70 split seeds** (100 to 7000 in steps of 100), each producing an independent
+64/16/20 split and a 919-row test set. Every figure below is computed from the observation-level
+predictions of that sweep — 64,330 rows, one per test instance per seed — recomputing balanced
+accuracy per seed from `Actual_Class` and each strategy's prediction column.
 
-| Strategy | Balanced accuracy |
-|---|---|
-| Standalone XGBoost | 0.9414 |
-| Hard voting | 0.9545 |
-| Standard stack | 0.9544 |
-| Pre-filtered stack | 0.9558 |
+Balanced accuracy on the test set, aggregated across seeds:
 
-93.9% of test instances cleared the 5-of-6 agreement gate and bypassed the meta-learner; 56 were
-routed to it. Note that the plots in this directory are drawn from a single seed, so the
-across-seed views degenerate to one point each.
+| Strategy | Mean BA | SD | Min | Max | Best on |
+|---|---|---|---|---|---|
+| **Standard stack** | **0.9462** | 0.0076 | 0.9249 | 0.9631 | 32/70 seeds |
+| Pre-filtered stack | 0.9451 | 0.0077 | 0.9265 | 0.9595 | 19/70 seeds |
+| Hard voting | 0.9435 | 0.0080 | 0.9176 | 0.9572 | 11/70 seeds |
+| Standalone XGBoost | 0.9396 | 0.0120 | 0.9004 | 0.9600 | 8/70 seeds |
 
-Reproducing this exactly requires the same package versions — the base learners are individually
-seeded (`set.seed(500 + fold)`-style offsets, preserved per model per fold), so the split and model
-fits are deterministic, but XGBoost and ranger can differ in the last few decimal places across
-thread counts and library versions.
+Because every strategy sees the identical split within a seed, the honest comparison is the paired
+difference. Pre-filtered stack minus each alternative, across the 70 seeds:
+
+| Comparison | Mean difference | 95% CI | Win / tie / loss | Paired t | Wilcoxon |
+|---|---|---|---|---|---|
+| vs standard stack | **−0.0012** | [−0.0022, −0.0001] | 27 / 1 / 42 | p = 0.035 | p = 0.041 |
+| vs hard voting | +0.0015 | [+0.0006, +0.0025] | 47 / 2 / 21 | p = 0.0021 | p = 0.0012 |
+| vs standalone XGBoost | +0.0055 | [+0.0034, +0.0075] | 53 / 0 / 17 | p = 1.2e-06 | p = 3.6e-07 |
+
+Read plainly:
+
+- **The pre-filter loses to standard stacking.** The deficit is small but statistically detectable,
+  and it loses on 42 of 70 seeds. Routing the confident cases around the meta-learner costs
+  something rather than buying something.
+- **It does beat hard voting and standalone XGBoost**, so the meta-learner still earns its place on
+  the difficult cases — the gate is what hurts, not the stacking.
+- **Every effect is small next to the noise.** Seed-to-seed SD is roughly 0.008, while the largest
+  paired effect is 0.0055. Any single seed can show the opposite ordering, so no conclusion here
+  should be drawn from one split.
+
+### Routing behaviour
+
+The 5-of-6 agreement gate accepts a direct vote for **94.9%** of test instances on average
+(SD 0.8pp, range 92.8–96.8%), leaving a mean of **47 of 919** cases per seed for the meta-learner.
+
+Pooled over all 70 seeds, split by the route an instance took:
+
+| Route | Instances | Accuracy | Balanced accuracy |
+|---|---|---|---|
+| Direct vote | 61,060 | 0.9618 | 0.9602 |
+| Meta-learner | 3,270 | 0.6642 | 0.6603 |
+
+The gate does isolate genuinely hard cases — accuracy on the routed 5% is close to a coin flip.
+But that subset is small and its class balance is similar to the whole (37% vs 39% spam), so the
+meta-learner is being retrained on a few hundred difficult training rows, which is the most likely
+source of the pre-filter's instability.
+
+### Committed reference run
+
+`prefilter_seed_results/` contains **one** run, at `split_seed = 700`, produced by this `.Rmd` on a
+desktop. It is not representative: seed 700 is one of the 27 seeds where the pre-filter happens to
+beat the standard stack. Its cross-seed plots also degenerate to a single point each. Treat it as a
+worked example of the output format, not as evidence — the table above is the evidence.
+
+### On exact reproducibility
+
+The 70-seed sweep was run in a different environment from the committed seed-700 run. Comparing
+seed 700 across the two, the base-learner probabilities agree to 7–10 decimal places (elastic net,
+random forest and XGBoost are bit-identical; GAM, MARS and SVM differ around 1e-10 to 1e-7), and
+standalone XGBoost and hard voting reproduce exactly. The two meta-learner strategies do not: the
+standard stack differs by 0.001 and the pre-filtered stack by 0.006 balanced accuracy.
+
+This is expected rather than alarming. The base learners are individually seeded
+(`set.seed(500 + fold)`-style offsets, preserved per model per fold), so the split and the fits are
+deterministic within an environment, but XGBoost, ranger and the C-level solvers differ in their
+last decimals across thread counts, BLAS builds and library versions. The vote gate and the
+threshold sweeps are discrete, so negligible probability shifts flip individual votes, change which
+instances get routed, and move the selected threshold — and the pre-filter's meta-learner, trained
+on the smallest subset, absorbs the most of it. Expect to reproduce the *ordering* and the
+*magnitudes* here, not the digits.
 
 ## Method notes
 
