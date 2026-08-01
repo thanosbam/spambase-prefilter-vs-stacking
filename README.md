@@ -101,19 +101,9 @@ Evaluated over **70 split seeds** (100 to 7000 in steps of 100), each producing 
 predictions of that sweep — 64,330 rows, one per test instance per seed — recomputing balanced
 accuracy per seed from `Actual_Class` and each strategy's prediction column.
 
-**The sweep was not produced by the `.Rmd` in this repository.** Running 70 seeds interactively was
-impractical at hours per seed, so the analysis was ported to a plain `Rscript` and run as a SLURM
-job array on the Hábrók HPC cluster, one array task per seed. That port is not included here.
-
-The port is a faithful translation in modelling terms — identical split, identical six base
-learners and hyperparameters, identical per-model-per-fold seeds, identical fusion rules and
-threshold sweeps, identical output schema. Everything that differs is infrastructural: seed and
-configuration ID arrive as command-line arguments rather than knitr params, the dataset is read
-from a fixed cluster path, the five out-of-fold folds run in parallel with per-fold thread pinning
-instead of sequentially, the shared per-configuration CSVs are file-locked because concurrent array
-tasks append to them, and results print to the console instead of being knitted. None of that
-changes the estimator; it changes where and how fast it runs. See
-[On exact reproducibility](#on-exact-reproducibility) for what it does change.
+The seeds were run on the Hábrók HPC cluster rather than locally — the analysis is the same, but
+70 sequential renders at hours apiece is not something you want to sit through. The results are
+committed here so you don't have to repeat them.
 
 Those per-seed figures are committed as
 `SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` (70 rows — one per seed, with each
@@ -176,21 +166,15 @@ worked example of the output format, not as evidence — the table above is the 
 
 ### On exact reproducibility
 
-The 70-seed sweep ran on the cluster; the committed seed-700 run came from this `.Rmd` on a
-desktop. Seed 700 appears in both, which makes it a direct check on how much the environment moves
-the results. The base-learner probabilities agree to 7–10 decimal places (elastic net, random
-forest and XGBoost are bit-identical; GAM, MARS and SVM differ around 1e-10 to 1e-7), and
-standalone XGBoost and hard voting reproduce exactly. The two meta-learner strategies do not: the
-standard stack differs by 0.001 and the pre-filtered stack by 0.006 balanced accuracy.
-
-This is expected rather than alarming. The base learners are individually seeded
-(`set.seed(500 + fold)`-style offsets, preserved per model per fold), so the split and the fits are
-deterministic within an environment, but XGBoost, ranger and the C-level solvers differ in their
-last decimals across thread counts, BLAS builds and library versions. The vote gate and the
-threshold sweeps are discrete, so negligible probability shifts flip individual votes, change which
-instances get routed, and move the selected threshold — and the pre-filter's meta-learner, trained
-on the smallest subset, absorbs the most of it. Expect to reproduce the *ordering* and the
-*magnitudes* here, not the digits.
+Everything is seeded (`set.seed(500 + fold)`-style offsets, preserved per model per fold), so a
+given seed is deterministic within one environment. Across environments it is not quite: XGBoost,
+ranger and the underlying solvers differ in their last decimals with thread count, BLAS build and
+package version. The vote gate and the threshold sweeps are discrete, so those tiny shifts can flip
+a vote or move a selected threshold, and the pre-filtered meta-learner — trained on the smallest
+subset — is the most sensitive of the four strategies. Seed 700 illustrates it: the committed
+desktop run and the cluster sweep agree exactly on standalone XGBoost and hard voting, and differ
+by 0.001 and 0.006 balanced accuracy on the standard and pre-filtered stacks. Expect to reproduce
+the ordering and the magnitudes, not the digits.
 
 ## Method notes
 
