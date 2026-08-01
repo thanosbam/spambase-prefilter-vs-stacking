@@ -31,6 +31,7 @@ including the paired tests, are in [Results](#results) below.
 | `spambase.data` | UCI Spambase: 4601 rows x 58 columns, CSV, no header row. |
 | `spambase.names` | Attribute list defining the exact column order of `spambase.data`. |
 | `spambase.DOCUMENTATION` | UCI dataset writeup: source, collection method, per-attribute statistics. |
+| `SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` | Per-seed metrics for the 70-seed sweep — the source of every number in [Results](#results). |
 | `prefilter_seed_results/` | Committed output of one reference run (`split_seed = 700`). |
 
 ## Requirements
@@ -99,6 +100,12 @@ Evaluated over **70 split seeds** (100 to 7000 in steps of 100), each producing 
 64/16/20 split and a 919-row test set. Every figure below is computed from the observation-level
 predictions of that sweep — 64,330 rows, one per test instance per seed — recomputing balanced
 accuracy per seed from `Actual_Class` and each strategy's prediction column.
+
+Those per-seed figures are committed as
+`SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` (70 rows — one per seed, with each
+strategy's balanced accuracy and accuracy, the routing counts, per-route accuracy, and the paired
+differences), so every table and test below can be recomputed from this repository. The
+observation-level file it was derived from is ~18 MB and is not included.
 
 Balanced accuracy on the test set, aggregated across seeds:
 
