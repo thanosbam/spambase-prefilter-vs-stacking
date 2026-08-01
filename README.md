@@ -101,6 +101,20 @@ Evaluated over **70 split seeds** (100 to 7000 in steps of 100), each producing 
 predictions of that sweep — 64,330 rows, one per test instance per seed — recomputing balanced
 accuracy per seed from `Actual_Class` and each strategy's prediction column.
 
+**The sweep was not produced by the `.Rmd` in this repository.** Running 70 seeds interactively was
+impractical at hours per seed, so the analysis was ported to a plain `Rscript` and run as a SLURM
+job array on the Hábrók HPC cluster, one array task per seed. That port is not included here.
+
+The port is a faithful translation in modelling terms — identical split, identical six base
+learners and hyperparameters, identical per-model-per-fold seeds, identical fusion rules and
+threshold sweeps, identical output schema. Everything that differs is infrastructural: seed and
+configuration ID arrive as command-line arguments rather than knitr params, the dataset is read
+from a fixed cluster path, the five out-of-fold folds run in parallel with per-fold thread pinning
+instead of sequentially, the shared per-configuration CSVs are file-locked because concurrent array
+tasks append to them, and results print to the console instead of being knitted. None of that
+changes the estimator; it changes where and how fast it runs. See
+[On exact reproducibility](#on-exact-reproducibility) for what it does change.
+
 Those per-seed figures are committed as
 `SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` (70 rows — one per seed, with each
 strategy's balanced accuracy and accuracy, the routing counts, per-route accuracy, and the paired
@@ -162,9 +176,10 @@ worked example of the output format, not as evidence — the table above is the 
 
 ### On exact reproducibility
 
-The 70-seed sweep was run in a different environment from the committed seed-700 run. Comparing
-seed 700 across the two, the base-learner probabilities agree to 7–10 decimal places (elastic net,
-random forest and XGBoost are bit-identical; GAM, MARS and SVM differ around 1e-10 to 1e-7), and
+The 70-seed sweep ran on the cluster; the committed seed-700 run came from this `.Rmd` on a
+desktop. Seed 700 appears in both, which makes it a direct check on how much the environment moves
+the results. The base-learner probabilities agree to 7–10 decimal places (elastic net, random
+forest and XGBoost are bit-identical; GAM, MARS and SVM differ around 1e-10 to 1e-7), and
 standalone XGBoost and hard voting reproduce exactly. The two meta-learner strategies do not: the
 standard stack differs by 0.001 and the pre-filtered stack by 0.006 balanced accuracy.
 
