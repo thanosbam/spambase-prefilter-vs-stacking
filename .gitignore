@@ -1,0 +1,14 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Knitted output
+prefilter_majority_voting_comparison_spambase.html
+*_files/
+*_cache/
+
+# OS
+Thumbs.db
+.DS_Store
