@@ -1,0 +1,4 @@
+# GitHub classifies .Rmd as RMarkdown (prose), which is left out of the
+# language bar. Count the analyses as R instead.
+*.Rmd linguist-language=R linguist-detectable=true
+*.rmd linguist-language=R linguist-detectable=true
