@@ -27,12 +27,13 @@ including the paired tests, are in [Results](#results) below.
 
 | Path | Description |
 |---|---|
-| `prefilter_majority_voting_comparison_spambase.Rmd` | The complete analysis — the only code file. |
+| `prefilter_majority_voting_comparison_spambase.Rmd` | The complete analysis, parameterised for local rendering. |
 | `spambase.data` | UCI Spambase: 4601 rows x 58 columns, CSV, no header row. |
 | `spambase.names` | Attribute list defining the exact column order of `spambase.data`. |
 | `spambase.DOCUMENTATION` | UCI dataset writeup: source, collection method, per-attribute statistics. |
 | `SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` | Per-seed metrics for the 70-seed sweep — the source of every number in [Results](#results). |
 | `prefilter_seed_results/` | Committed output of one reference run (`split_seed = 700`). |
+| `hpc/` | The cluster scripts that produced the 70-seed sweep — see [Results](#results). |
 
 ## Requirements
 
@@ -104,6 +105,22 @@ accuracy per seed from `Actual_Class` and each strategy's prediction column.
 The seeds were run on the Hábrók HPC cluster rather than locally — the analysis is the same, but
 70 sequential renders at hours apiece is not something you want to sit through. The results are
 committed here so you don't have to repeat them.
+
+The scripts that produced the sweep are in `hpc/`: `prefilter_majority_voting_comparison_spambase_habrok.R`,
+a plain `Rscript` port of the `.Rmd`, and `submit_habrok.sh`, the SLURM array job that ran it once per
+seed. They are committed for transparency about what was actually run, not for reuse — the data path
+and the project directory are hardcoded to the cluster account, so they will not run elsewhere
+unedited. Most people do not have Hábrók access; the `.Rmd` at the repository root is the version
+to run locally.
+
+What differs between the two is infrastructural only: the seed and configuration ID arrive as
+command-line arguments rather than knitr params, the dataset is read from a fixed cluster path, the
+five out-of-fold folds run in parallel with per-fold thread pinning instead of sequentially, the
+shared per-configuration CSVs are file-locked because concurrent array tasks append to them, and
+results print to the console instead of being knitted. The split, the six base learners and their
+hyperparameters, the per-model-per-fold seeds, the fusion rules, the threshold sweeps and the output
+schema are identical. See [On exact reproducibility](#on-exact-reproducibility) for what the change
+of environment does cost.
 
 Those per-seed figures are committed as
 `SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` (70 rows — one per seed, with each

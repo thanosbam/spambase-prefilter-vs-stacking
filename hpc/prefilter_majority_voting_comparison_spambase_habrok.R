@@ -1,0 +1,3748 @@
+#!/usr/bin/env Rscript
+#
+# Habrok batch version of prefilter_majority_voting_comparison_spambase.Rmd
+#
+# Differences from the .Rmd (search "HABROK:" for each one):
+#   - Plain Rscript, no pandoc/HTML rendering required on the compute node.
+#   - split_seed / configuration_id come from the command line instead of
+#     knit params, so a SLURM job array can run many seeds concurrently:
+#       Rscript prefilter_majority_voting_comparison_spambase_habrok.R 700 SpambasePrefilter5of6OOFThresholds
+#   - spambase.data is read from /home3/s6018130/data/ instead of the
+#     project folder.
+#   - The 5-fold OOF loop runs folds in parallel (they are independent),
+#     since this loop (tune.svm grid search x GAM x MARS x ranger x xgboost,
+#     five times) is almost certainly most of the ~4 hour local runtime.
+#   - xgboost/ranger use multiple threads for the once-off full-data models.
+#   - The shared per-configuration CSVs (seed_results, test_predictions,
+#     pairwise_diversity) are now file-locked around their read-modify-write
+#     sections, because multiple SLURM array tasks (one per seed) may try to
+#     append to the same CSV at the same time.
+
+## ---- Command-line arguments -------------------------------------------
+
+args <- commandArgs(trailingOnly = TRUE)
+
+split_seed <- if (length(args) >= 1) as.integer(args[[1]]) else 700
+configuration_id <- if (length(args) >= 2) args[[2]] else "SpambasePrefilter5of6OOFThresholds"
+
+cat("split_seed =", split_seed, "\n")
+cat("configuration_id =", configuration_id, "\n")
+
+## ---- Libraries ----------------------------------------------------------
+
+library(earth)
+library(caret)
+library(xgboost)
+library(e1071)
+library(glmnet)
+library(ranger)
+library(mgcv)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(filelock)
+
+## ---- HABROK: cores available for this SLURM task ------------------------
+
+n_cores <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA)))
+if (is.na(n_cores) || n_cores < 1) {
+  n_cores <- max(1, parallel::detectCores() - 1)
+}
+cat("Using", n_cores, "cores\n")
+
+## ---- HABROK: file locking helper for shared per-configuration CSVs ------
+
+with_file_lock <- function(path, expr) {
+  lock_path <- paste0(path, ".lock")
+  lock <- filelock::lock(lock_path)
+  on.exit(filelock::unlock(lock), add = TRUE)
+  force(expr)
+}
+
+## ---- Load and prepare the data ------------------------------------------
+
+# HABROK: data lives outside the code folder on the cluster.
+data_path <- "/home3/s6018130/data/spambase.data"
+
+spambase_columns <- c(
+  "word_freq_make", "word_freq_address", "word_freq_all", "word_freq_3d",
+  "word_freq_our", "word_freq_over", "word_freq_remove", "word_freq_internet",
+  "word_freq_order", "word_freq_mail", "word_freq_receive", "word_freq_will",
+  "word_freq_people", "word_freq_report", "word_freq_addresses", "word_freq_free",
+  "word_freq_business", "word_freq_email", "word_freq_you", "word_freq_credit",
+  "word_freq_your", "word_freq_font", "word_freq_000", "word_freq_money",
+  "word_freq_hp", "word_freq_hpl", "word_freq_george", "word_freq_650",
+  "word_freq_lab", "word_freq_labs", "word_freq_telnet", "word_freq_857",
+  "word_freq_data", "word_freq_415", "word_freq_85", "word_freq_technology",
+  "word_freq_1999", "word_freq_parts", "word_freq_pm", "word_freq_direct",
+  "word_freq_cs", "word_freq_meeting", "word_freq_original", "word_freq_project",
+  "word_freq_re", "word_freq_edu", "word_freq_table", "word_freq_conference",
+  "char_freq_semicolon", "char_freq_paren", "char_freq_bracket",
+  "char_freq_bang", "char_freq_dollar", "char_freq_hash",
+  "capital_run_length_average", "capital_run_length_longest",
+  "capital_run_length_total", "spam"
+)
+
+df <- read.csv(
+  data_path,
+  header = FALSE,
+  col.names = spambase_columns
+)
+
+df$spam <- factor(
+  df$spam,
+  levels = c(0, 1)
+)
+
+## ---- Train, validation, and test split ----------------------------------
+
+set.seed(split_seed)
+
+train_validation_index <- createDataPartition(
+  df$spam,
+  p = 0.8,
+  list = FALSE
+)
+
+train_validation <- df[train_validation_index, ]
+test <- df[-train_validation_index, ]
+
+train_index <- createDataPartition(
+  train_validation$spam,
+  p = 0.8,
+  list = FALSE
+)
+
+train <- train_validation[train_index, ]
+validation <- train_validation[-train_index, ]
+
+## ---- Evaluation functions ------------------------------------------------
+
+evaluate_model <- function(predicted, actual) {
+
+  predicted <- factor(predicted, levels = c(0, 1))
+  actual <- factor(actual, levels = c(0, 1))
+
+  cm <- table(
+    Predicted = predicted,
+    Actual = actual
+  )
+
+  TN <- cm["0", "0"]
+  FN <- cm["0", "1"]
+  FP <- cm["1", "0"]
+  TP <- cm["1", "1"]
+
+  accuracy <- (TP + TN) / sum(cm)
+
+  precision <- ifelse(
+    TP + FP == 0,
+    0,
+    TP / (TP + FP)
+  )
+
+  recall <- ifelse(
+    TP + FN == 0,
+    0,
+    TP / (TP + FN)
+  )
+
+  specificity <- ifelse(
+    TN + FP == 0,
+    0,
+    TN / (TN + FP)
+  )
+
+  f1 <- ifelse(
+    precision + recall == 0,
+    0,
+    2 * precision * recall /
+      (precision + recall)
+  )
+
+  balanced_accuracy <- (
+    recall + specificity
+  ) / 2
+
+  c(
+    Accuracy = accuracy,
+    Balanced_Accuracy = balanced_accuracy,
+    Precision = precision,
+    Recall = recall,
+    Specificity = specificity,
+    F1 = f1
+  )
+}
+
+find_threshold <- function(probabilities,
+                           actual,
+                           metric = "Balanced_Accuracy") {
+
+  thresholds <- seq(
+    0.05,
+    0.95,
+    by = 0.01
+  )
+
+  scores <- sapply(
+    thresholds,
+    function(threshold) {
+
+      predicted <- ifelse(
+        probabilities >= threshold,
+        "1",
+        "0"
+      )
+
+      predicted <- factor(
+        predicted,
+        levels = c("0", "1")
+      )
+
+      evaluate_model(
+        predicted,
+        actual
+      )[metric]
+    }
+  )
+
+  thresholds[which.max(scores)]
+}
+
+## ---- Voting and pre-filtering functions ----------------------------------
+
+make_vote_information <- function(probability_features,
+                                  probability_threshold = 0.5,
+                                  confidence_votes = NULL) {
+
+  probability_matrix <- as.matrix(probability_features)
+
+  if (!is.numeric(probability_matrix)) {
+    stop("All base-learner features must be numeric probabilities.")
+  }
+
+  number_of_models <- ncol(probability_matrix)
+
+  if (is.null(confidence_votes)) {
+    confidence_votes <- number_of_models - 1L
+  }
+
+  if (length(probability_threshold) == 1L) {
+    probability_threshold <- rep(
+      probability_threshold,
+      number_of_models
+    )
+  }
+
+  if (length(probability_threshold) != number_of_models) {
+    stop(
+      paste(
+        "probability_threshold must contain either one value",
+        "or one value per base learner."
+      )
+    )
+  }
+
+  if (
+    confidence_votes < 1L ||
+    confidence_votes > number_of_models
+  ) {
+    stop("confidence_votes must be between 1 and the ensemble size.")
+  }
+
+  hard_predictions <- matrix(
+    FALSE,
+    nrow = nrow(probability_matrix),
+    ncol = number_of_models
+  )
+
+  for (model_number in seq_len(number_of_models)) {
+    hard_predictions[, model_number] <-
+      probability_matrix[, model_number] >=
+      probability_threshold[model_number]
+  }
+
+  colnames(hard_predictions) <- colnames(
+    probability_matrix
+  )
+
+  positive_votes <- rowSums(hard_predictions)
+  negative_votes <- number_of_models - positive_votes
+  maximum_votes <- pmax(positive_votes, negative_votes)
+
+  majority_label <- ifelse(
+    positive_votes > negative_votes,
+    "1",
+    ifelse(
+      negative_votes > positive_votes,
+      "0",
+      NA_character_
+    )
+  )
+
+  confident <- maximum_votes >= confidence_votes
+
+  list(
+    summary = data.frame(
+      Positive_Votes = positive_votes,
+      Negative_Votes = negative_votes,
+      Maximum_Votes = maximum_votes,
+      Majority_Label = majority_label,
+      Confident = confident,
+      stringsAsFactors = FALSE
+    ),
+    hard_predictions = hard_predictions,
+    probability_thresholds = probability_threshold,
+    confidence_votes = confidence_votes
+  )
+}
+
+compose_prefilter_predictions <- function(meta_probabilities,
+                                          vote_information,
+                                          meta_threshold) {
+
+  vote_summary <- vote_information$summary
+
+  if (length(meta_probabilities) != nrow(vote_summary)) {
+    stop(
+      paste(
+        "meta_probabilities and vote_information",
+        "must refer to the same observations."
+      )
+    )
+  }
+
+  final_labels <- ifelse(
+    meta_probabilities >= meta_threshold,
+    "1",
+    "0"
+  )
+
+  confident_index <- which(vote_summary$Confident)
+
+  if (length(confident_index) > 0L) {
+    final_labels[confident_index] <-
+      vote_summary$Majority_Label[confident_index]
+  }
+
+  factor(
+    final_labels,
+    levels = c("0", "1")
+  )
+}
+
+find_prefilter_threshold <- function(meta_probabilities,
+                                     vote_information,
+                                     actual,
+                                     metric = "Balanced_Accuracy") {
+
+  thresholds <- seq(
+    0.05,
+    0.95,
+    by = 0.01
+  )
+
+  scores <- sapply(
+    thresholds,
+    function(threshold) {
+
+      predicted <- compose_prefilter_predictions(
+        meta_probabilities = meta_probabilities,
+        vote_information = vote_information,
+        meta_threshold = threshold
+      )
+
+      evaluate_model(
+        predicted,
+        actual
+      )[metric]
+    }
+  )
+
+  thresholds[which.max(scores)]
+}
+
+make_hard_vote_predictions <- function(
+    probability_features,
+    probability_threshold = 0.5) {
+
+  probability_matrix <- as.matrix(
+    probability_features
+  )
+
+  number_of_models <- ncol(
+    probability_matrix
+  )
+
+  if (length(probability_threshold) == 1L) {
+    probability_threshold <- rep(
+      probability_threshold,
+      number_of_models
+    )
+  }
+
+  if (
+    length(probability_threshold) !=
+      number_of_models
+  ) {
+    stop(
+      paste(
+        "probability_threshold must contain",
+        "one value or one threshold per learner."
+      )
+    )
+  }
+
+  vote_information <- make_vote_information(
+    probability_features =
+      probability_features,
+    probability_threshold =
+      probability_threshold,
+    confidence_votes = 1L
+  )
+
+  vote_summary <- vote_information$summary
+  final_labels <- vote_summary$Majority_Label
+
+  # A six-model ensemble may produce a 3:3 tie.
+  # Resolve it using the average signed distance
+  # from each learner's own threshold.
+  tied <- is.na(final_labels)
+
+  if (any(tied)) {
+
+    probability_margins <- sweep(
+      probability_matrix,
+      MARGIN = 2,
+      STATS = probability_threshold,
+      FUN = "-"
+    )
+
+    mean_margin <- rowMeans(
+      probability_margins
+    )
+
+    final_labels[tied] <- ifelse(
+      mean_margin[tied] >= 0,
+      "1",
+      "0"
+    )
+  }
+
+  factor(
+    final_labels,
+    levels = c("0", "1")
+  )
+}
+
+## ---- Standalone XGBoost ---------------------------------------------------
+
+x_train <- model.matrix(
+  spam ~ . - 1,
+  data = train
+)
+
+x_validation <- model.matrix(
+  spam ~ . - 1,
+  data = validation
+)
+
+x_test <- model.matrix(
+  spam ~ . - 1,
+  data = test
+)
+
+y_train <- as.numeric(train$spam) - 1
+y_validation <- as.numeric(validation$spam) - 1
+y_test <- as.numeric(test$spam) - 1
+
+dtrain <- xgb.DMatrix(
+  data = x_train,
+  label = y_train
+)
+
+dvalidation <- xgb.DMatrix(
+  data = x_validation,
+  label = y_validation
+)
+
+dtest <- xgb.DMatrix(
+  data = x_test,
+  label = y_test
+)
+
+xgb_positive_weight <- sum(y_train == 0) /
+  sum(y_train == 1)
+
+xgb_positive_weight
+
+set.seed(100)
+
+xgb_parameters <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  tree_method = "hist",
+  max_depth = 3,
+  learning_rate = 0.05,
+  min_child_weight = 5,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  reg_lambda = 1,
+  reg_alpha = 0,
+  scale_pos_weight = xgb_positive_weight,
+  seed = 100,
+  nthread = n_cores # HABROK: use all cores allocated to this task
+)
+
+xgb_model <- xgb.train(
+  params = xgb_parameters,
+  data = dtrain,
+  nrounds = 1000,
+  evals = list(
+    train = dtrain,
+    validation = dvalidation
+  ),
+  early_stopping_rounds = 30,
+  maximize = TRUE,
+  verbose = 1,
+  print_every_n = 25
+)
+
+xgb_validation_prob <- predict(
+  xgb_model,
+  dvalidation
+)
+
+xgb_threshold <- find_threshold(
+  probabilities = xgb_validation_prob,
+  actual = validation$spam,
+  metric = "Balanced_Accuracy"
+)
+
+xgb_threshold
+
+xgb_prob <- predict(
+  xgb_model,
+  dtest
+)
+
+xgb_pred <- factor(
+  ifelse(
+    xgb_prob >= xgb_threshold,
+    "1",
+    "0"
+  ),
+  levels = c("0", "1")
+)
+
+xgb_metrics <- evaluate_model(
+  xgb_pred,
+  test$spam
+)
+
+xgb_metrics
+
+## ---- Base learners for stacking ------------------------------------------
+
+# Elastic-net logistic regression
+
+x_train <- model.matrix(
+  spam ~ . - 1,
+  data = train
+)
+
+x_validation <- model.matrix(
+  spam ~ . - 1,
+  data = validation
+)
+
+x_test <- model.matrix(
+  spam ~ . - 1,
+  data = test
+)
+
+y_train <- as.numeric(train$spam) - 1
+
+set.seed(500)
+
+elastic_net_model <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 0.25,
+  type.measure = "deviance",
+  nfolds = 5
+)
+
+elastic_net_validation_prob <- as.numeric(
+  predict(
+    elastic_net_model,
+    newx = x_validation,
+    s = "lambda.min",
+    type = "response"
+  )
+)
+
+elastic_net_test_prob <- as.numeric(
+  predict(
+    elastic_net_model,
+    newx = x_test,
+    s = "lambda.min",
+    type = "response"
+  )
+)
+
+# Generalized additive model
+
+predictor_names <- setdiff(
+  names(train),
+  "spam"
+)
+
+gam_formula <- as.formula(
+  paste(
+    "spam ~",
+    paste(
+      sprintf(
+        "s(`%s`, k = 5)",
+        predictor_names
+      ),
+      collapse = " + "
+    )
+  )
+)
+
+set.seed(550)
+
+gam_model <- gam(
+  formula = gam_formula,
+  data = train,
+  family = binomial,
+  method = "REML",
+  select = TRUE
+)
+
+gam_validation_prob <- as.numeric(
+  predict(
+    gam_model,
+    newdata = validation,
+    type = "response"
+  )
+)
+
+gam_test_prob <- as.numeric(
+  predict(
+    gam_model,
+    newdata = test,
+    type = "response"
+  )
+)
+
+# Random forest
+
+set.seed(600)
+
+rf_positive_weight <-
+  sum(train$spam == "0") /
+  sum(train$spam == "1")
+
+rf_model <- ranger(
+  spam ~ .,
+  data = train,
+  probability = TRUE,
+  num.trees = 1000,
+  mtry = 3,
+  min.node.size = 10,
+  sample.fraction = 0.8,
+  class.weights = c(
+    "0" = 1,
+    "1" = rf_positive_weight
+  ),
+  seed = 600,
+  num.threads = n_cores # HABROK: use all cores allocated to this task
+)
+
+rf_validation_prob <- predict(
+  rf_model,
+  data = validation
+)$predictions[, "1"]
+
+rf_test_prob <- predict(
+  rf_model,
+  data = test
+)$predictions[, "1"]
+
+# Tuned radial support vector machine
+
+set.seed(700)
+
+svm_tuning <- tune.svm(
+  spam ~ .,
+  data = train,
+  kernel = "radial",
+  probability = TRUE,
+  scale = TRUE,
+  cost = c(
+    0.1,
+    1,
+    10
+  ),
+  gamma = c(
+    0.01,
+    0.05,
+    0.1
+  ),
+  tunecontrol = tune.control(
+    sampling = "cross",
+    cross = 3
+  )
+)
+
+svm_model <- svm_tuning$best.model
+
+svm_tuning$best.parameters
+
+svm_validation_raw <- predict(
+  svm_model,
+  newdata = validation,
+  probability = TRUE
+)
+
+svm_validation_prob <- attr(
+  svm_validation_raw,
+  "probabilities"
+)[, "1"]
+
+svm_test_raw <- predict(
+  svm_model,
+  newdata = test,
+  probability = TRUE
+)
+
+svm_test_prob <- attr(
+  svm_test_raw,
+  "probabilities"
+)[, "1"]
+
+# Multivariate adaptive regression spline
+
+set.seed(800)
+
+mars_model <- earth(
+  spam ~ .,
+  data = train,
+  degree = 2,
+  nprune = 20,
+  glm = list(
+    family = binomial
+  )
+)
+
+mars_validation_prob <- as.numeric(
+  predict(
+    mars_model,
+    newdata = validation,
+    type = "response"
+  )
+)
+
+mars_test_prob <- as.numeric(
+  predict(
+    mars_model,
+    newdata = test,
+    type = "response"
+  )
+)
+
+## ---- Out-of-fold predictions for the meta-learner -------------------------
+
+set.seed(300)
+
+stack_folds <- createFolds(
+  train$spam,
+  k = 5,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+stack_train_features <- data.frame(
+  ElasticNet = rep(NA_real_, nrow(train)),
+  GAM = rep(NA_real_, nrow(train)),
+  MARS = rep(NA_real_, nrow(train)),
+  RandomForest = rep(NA_real_, nrow(train)),
+  XGBoost = rep(NA_real_, nrow(train)),
+  SVM = rep(NA_real_, nrow(train))
+)
+
+best_iteration <- xgb.attr(
+  xgb_model,
+  "best_iteration"
+)
+
+if (is.null(best_iteration)) {
+  stop(
+    paste(
+      "The standalone XGBoost model does not contain",
+      "a best_iteration attribute.",
+      "Run the XGBoost training block first."
+    )
+  )
+}
+
+xgb_stack_nrounds <- as.integer(
+  best_iteration
+) + 1L
+
+if (
+  length(xgb_stack_nrounds) != 1 ||
+  is.na(xgb_stack_nrounds) ||
+  xgb_stack_nrounds < 1
+) {
+  stop("xgb_stack_nrounds is not a valid positive integer.")
+}
+
+xgb_stack_nrounds
+
+# HABROK: the five folds are independent of each other, so this is the
+# single biggest win available without touching the modelling logic.
+# Each fold still sets its own seeds exactly as before (500+fold, 550+fold,
+# 800+fold, 300+fold, 700+fold) so results are identical to running the
+# loop sequentially - only the wall-clock time changes.
+#
+# nthread/num.threads are pinned to 1 *inside* each fold worker to avoid
+# oversubscribing CPUs (fold-level parallelism x model-level threading).
+
+fold_workers <- min(n_cores, length(stack_folds))
+cat("Running", length(stack_folds), "OOF folds across", fold_workers, "worker(s)\n")
+
+fold_cluster <- parallel::makeCluster(fold_workers)
+doParallel::registerDoParallel(fold_cluster)
+
+fold_results <- foreach(
+  fold_number = seq_along(stack_folds),
+  .packages = c("glmnet", "mgcv", "earth", "ranger", "xgboost", "e1071")
+) %dopar% {
+
+  fold_validation_index <- stack_folds[[fold_number]]
+
+  fold_train <- train[-fold_validation_index, ]
+  fold_validation <- train[fold_validation_index, ]
+
+  # Elastic-net logistic regression
+
+  fold_elastic_x_train <- model.matrix(
+    spam ~ . - 1,
+    data = fold_train
+  )
+
+  fold_elastic_x_validation <- model.matrix(
+    spam ~ . - 1,
+    data = fold_validation
+  )
+
+  fold_elastic_y_train <-
+    as.numeric(fold_train$spam) - 1
+
+  set.seed(500 + fold_number)
+
+  fold_elastic_net_model <- cv.glmnet(
+    x = fold_elastic_x_train,
+    y = fold_elastic_y_train,
+    family = "binomial",
+    alpha = 0.25,
+    type.measure = "deviance",
+    nfolds = 5
+  )
+
+  elastic_net_out <- as.numeric(
+    predict(
+      fold_elastic_net_model,
+      newx = fold_elastic_x_validation,
+      s = "lambda.min",
+      type = "response"
+    )
+  )
+
+  # Generalized additive model
+
+  set.seed(550 + fold_number)
+
+  fold_gam_model <- gam(
+    formula = gam_formula,
+    data = fold_train,
+    family = binomial,
+    method = "REML",
+    select = TRUE
+  )
+
+  gam_out <- as.numeric(
+    predict(
+      fold_gam_model,
+      newdata = fold_validation,
+      type = "response"
+    )
+  )
+
+  # Multivariate adaptive regression spline
+  set.seed(800 + fold_number)
+
+  fold_mars_model <- earth(
+    spam ~ .,
+    data = fold_train,
+    degree = 2,
+    nprune = 20,
+    glm = list(
+      family = binomial
+    )
+  )
+
+  mars_out <- as.numeric(
+    predict(
+      fold_mars_model,
+      newdata = fold_validation,
+      type = "response"
+    )
+  )
+
+  # Random forest
+  set.seed(300 + fold_number)
+
+  fold_positive_weight <-
+    sum(fold_train$spam == "0") /
+    sum(fold_train$spam == "1")
+
+  fold_rf_model <- ranger(
+    spam ~ .,
+    data = fold_train,
+    probability = TRUE,
+    num.trees = 1000,
+    mtry = 3,
+    min.node.size = 10,
+    sample.fraction = 0.8,
+    class.weights = c(
+      "0" = 1,
+      "1" = fold_positive_weight
+    ),
+    seed = 300 + fold_number,
+    num.threads = 1 # HABROK: avoid oversubscription, folds already parallel
+  )
+
+  rf_out <- predict(
+    fold_rf_model,
+    data = fold_validation
+  )$predictions[, "1"]
+
+  # XGBoost
+  fold_x_train <- model.matrix(
+    spam ~ . - 1,
+    data = fold_train
+  )
+
+  fold_x_validation <- model.matrix(
+    spam ~ . - 1,
+    data = fold_validation
+  )
+
+  fold_y_train <- as.numeric(
+    fold_train$spam
+  ) - 1
+
+  fold_dtrain <- xgb.DMatrix(
+    data = fold_x_train,
+    label = fold_y_train
+  )
+
+  fold_dvalidation <- xgb.DMatrix(
+    data = fold_x_validation
+  )
+
+  fold_xgb_parameters <- xgb_parameters
+  fold_xgb_parameters$scale_pos_weight <-
+    sum(fold_y_train == 0) /
+    sum(fold_y_train == 1)
+  fold_xgb_parameters$seed <- 300 + fold_number
+  fold_xgb_parameters$nthread <- 1 # HABROK: avoid oversubscription
+
+  fold_xgb_model <- xgb.train(
+    params = fold_xgb_parameters,
+    data = fold_dtrain,
+    nrounds = xgb_stack_nrounds,
+    verbose = 0
+  )
+
+  xgb_out <- predict(
+    fold_xgb_model,
+    fold_dvalidation
+  )
+
+  # Tuned radial SVM
+
+  set.seed(700 + fold_number)
+
+  fold_svm_tuning <- tune.svm(
+    spam ~ .,
+    data = fold_train,
+    kernel = "radial",
+    probability = TRUE,
+    scale = TRUE,
+    cost = c(
+      0.1,
+      1,
+      10
+    ),
+    gamma = c(
+      0.01,
+      0.05,
+      0.1
+    ),
+    tunecontrol = tune.control(
+      sampling = "cross",
+      cross = 3
+    )
+  )
+
+  fold_svm_model <-
+    fold_svm_tuning$best.model
+
+  fold_svm_raw <- predict(
+    fold_svm_model,
+    newdata = fold_validation,
+    probability = TRUE
+  )
+
+  svm_out <- attr(
+    fold_svm_raw,
+    "probabilities"
+  )[, "1"]
+
+  list(
+    index = fold_validation_index,
+    ElasticNet = elastic_net_out,
+    GAM = gam_out,
+    MARS = mars_out,
+    RandomForest = rf_out,
+    XGBoost = xgb_out,
+    SVM = svm_out
+  )
+}
+
+parallel::stopCluster(fold_cluster)
+
+for (fold_result in fold_results) {
+  fold_validation_index <- fold_result$index
+  stack_train_features$ElasticNet[fold_validation_index] <- fold_result$ElasticNet
+  stack_train_features$GAM[fold_validation_index] <- fold_result$GAM
+  stack_train_features$MARS[fold_validation_index] <- fold_result$MARS
+  stack_train_features$RandomForest[fold_validation_index] <- fold_result$RandomForest
+  stack_train_features$XGBoost[fold_validation_index] <- fold_result$XGBoost
+  stack_train_features$SVM[fold_validation_index] <- fold_result$SVM
+}
+
+## ---- Inspect the out-of-fold probability features -------------------------
+
+summary(stack_train_features)
+
+round(
+  cor(stack_train_features),
+  digits = 3
+)
+
+## ---- Evaluate the out-of-fold base learners --------------------------------
+
+oof_base_results <- lapply(
+  names(stack_train_features),
+  function(model_name) {
+
+    probabilities <-
+      stack_train_features[[model_name]]
+
+    threshold <- find_threshold(
+      probabilities = probabilities,
+      actual = train$spam,
+      metric = "Balanced_Accuracy"
+    )
+
+    predictions <- factor(
+      ifelse(
+        probabilities >= threshold,
+        "1",
+        "0"
+      ),
+      levels = c("0", "1")
+    )
+
+    metrics <- evaluate_model(
+      predictions,
+      train$spam
+    )
+
+    data.frame(
+      Model = model_name,
+      Threshold = threshold,
+      t(metrics),
+      row.names = NULL
+    )
+  }
+)
+
+oof_base_results <- do.call(
+  rbind,
+  oof_base_results
+)
+
+oof_base_results
+
+## ---- XGBoost meta-learner: construct meta-learning datasets ---------------
+
+stack_validation_features <- data.frame(
+  ElasticNet = as.numeric(
+    elastic_net_validation_prob
+  ),
+  GAM = as.numeric(
+    gam_validation_prob
+  ),
+  MARS = as.numeric(
+    mars_validation_prob
+  ),
+  RandomForest = as.numeric(
+    rf_validation_prob
+  ),
+  XGBoost = as.numeric(
+    xgb_validation_prob
+  ),
+  SVM = as.numeric(
+    svm_validation_prob
+  )
+)
+
+stack_test_features <- data.frame(
+  ElasticNet = as.numeric(
+    elastic_net_test_prob
+  ),
+  GAM = as.numeric(
+    gam_test_prob
+  ),
+  MARS = as.numeric(
+    mars_test_prob
+  ),
+  RandomForest = as.numeric(
+    rf_test_prob
+  ),
+  XGBoost = as.numeric(
+    xgb_prob
+  ),
+  SVM = as.numeric(
+    svm_test_prob
+  )
+)
+
+stack_train_labels <- as.numeric(train$spam) - 1
+stack_validation_labels <- as.numeric(validation$spam) - 1
+
+stack_positive_weight <- sum(stack_train_labels == 0) /
+  sum(stack_train_labels == 1)
+
+stopifnot(
+  !anyNA(stack_train_features),
+  !anyNA(stack_validation_features),
+  !anyNA(stack_test_features)
+)
+
+stopifnot(
+  identical(
+    colnames(stack_train_features),
+    colnames(stack_validation_features)
+  ),
+  identical(
+    colnames(stack_train_features),
+    colnames(stack_test_features)
+  )
+)
+
+colnames(stack_train_features)
+
+dstack_train <- xgb.DMatrix(
+  data = as.matrix(stack_train_features),
+  label = stack_train_labels
+)
+
+dstack_validation <- xgb.DMatrix(
+  data = as.matrix(stack_validation_features),
+  label = stack_validation_labels
+)
+
+dstack_test <- xgb.DMatrix(
+  data = as.matrix(stack_test_features)
+)
+
+# Individual base-learner performance on the test set
+
+stopifnot(
+  identical(
+    colnames(stack_validation_features),
+    colnames(stack_test_features)
+  )
+)
+
+base_learner_test_results <- lapply(
+  colnames(stack_validation_features),
+  function(model_name) {
+
+    validation_probabilities <-
+      stack_validation_features[[model_name]]
+
+    test_probabilities <-
+      stack_test_features[[model_name]]
+
+    # Select the threshold using validation data only
+    selected_threshold <- find_threshold(
+      probabilities = validation_probabilities,
+      actual = validation$spam,
+      metric = "Balanced_Accuracy"
+    )
+
+    # Apply the validation-selected threshold to the test data
+    test_predictions <- factor(
+      ifelse(
+        test_probabilities >= selected_threshold,
+        "1",
+        "0"
+      ),
+      levels = c("0", "1")
+    )
+
+    test_metrics <- evaluate_model(
+      predicted = test_predictions,
+      actual = test$spam
+    )
+
+    data.frame(
+      Seed = split_seed,
+      Configuration_ID = configuration_id,
+      Model = model_name,
+      Threshold = selected_threshold,
+      Accuracy = unname(
+        test_metrics["Accuracy"]
+      ),
+      Balanced_Accuracy = unname(
+        test_metrics["Balanced_Accuracy"]
+      ),
+      Precision = unname(
+        test_metrics["Precision"]
+      ),
+      Recall = unname(
+        test_metrics["Recall"]
+      ),
+      Specificity = unname(
+        test_metrics["Specificity"]
+      ),
+      F1 = unname(
+        test_metrics["F1"]
+      ),
+      row.names = NULL
+    )
+  }
+)
+
+# Convert the list returned by lapply into one data frame
+base_learner_test_results <- do.call(
+  rbind,
+  base_learner_test_results
+)
+
+# Convert the six model rows into one wide row for the final CSV
+base_learner_result_row <- base_learner_test_results |>
+  select(
+    -Seed,
+    -Configuration_ID
+  ) |>
+  pivot_wider(
+    names_from = Model,
+    values_from = c(
+      Threshold,
+      Accuracy,
+      Balanced_Accuracy,
+      Precision,
+      Recall,
+      Specificity,
+      F1
+    ),
+    names_glue = "Base_{Model}_{.value}"
+  )
+
+base_learner_test_results
+
+## ---- Train the XGBoost meta-learner ---------------------------------------
+
+set.seed(500)
+
+stack_parameters <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  tree_method = "hist",
+  max_depth = 2,
+  learning_rate = 0.05,
+  min_child_weight = 5,
+  subsample = 0.8,
+  colsample_bytree = 1,
+  reg_lambda = 1,
+  reg_alpha = 0,
+  scale_pos_weight = stack_positive_weight,
+  seed = 500,
+  nthread = n_cores # HABROK: use all cores allocated to this task
+)
+
+stack_model <- xgb.train(
+  params = stack_parameters,
+  data = dstack_train,
+  nrounds = 500,
+  evals = list(
+    train = dstack_train,
+    validation = dstack_validation
+  ),
+  early_stopping_rounds = 30,
+  maximize = TRUE,
+  verbose = 1,
+  print_every_n = 25
+)
+
+## ---- Inspect meta-learner feature importance ------------------------------
+
+stack_importance <- xgb.importance(
+  model = stack_model,
+  feature_names = colnames(
+    stack_train_features
+  )
+)
+
+stack_importance
+
+## ---- Select the ensemble threshold ----------------------------------------
+
+stack_validation_prob <- predict(
+  stack_model,
+  dstack_validation
+)
+
+stack_threshold <- find_threshold(
+  probabilities = stack_validation_prob,
+  actual = validation$spam,
+  metric = "Balanced_Accuracy"
+)
+
+stack_threshold
+
+## ---- Evaluate the stacked ensemble ----------------------------------------
+
+stack_prob <- predict(
+  stack_model,
+  dstack_test
+)
+
+stack_pred <- factor(
+  ifelse(
+    stack_prob >= stack_threshold,
+    "1",
+    "0"
+  ),
+  levels = c("0", "1")
+)
+
+stack_metrics <- evaluate_model(
+  stack_pred,
+  test$spam
+)
+
+stack_metrics
+
+## ---- Paper-inspired pre-filtering by strict majority agreement ------------
+
+number_of_base_learners <- ncol(
+  stack_train_features
+)
+
+# Select one voting threshold per learner using OOF training predictions
+base_vote_thresholds <- vapply(
+  colnames(stack_train_features),
+  function(model_name) {
+
+    find_threshold(
+      probabilities =
+        stack_train_features[[model_name]],
+      actual = train$spam,
+      metric = "Balanced_Accuracy"
+    )
+  },
+  numeric(1)
+)
+
+# Ensure thresholds follow the exact meta-feature column order
+base_vote_thresholds <- base_vote_thresholds[
+  colnames(stack_train_features)
+]
+
+# Use learner-specific thresholds instead of a common threshold of 0.5
+paper_probability_threshold <-
+  base_vote_thresholds
+
+# Current adapted experiment: agreement of at least n - 1 learners
+# (5 of 6 with the current ensemble size) bypasses XGBoost.
+paper_confidence_votes <-
+  number_of_base_learners - 1L
+
+base_vote_thresholds
+
+paper_train_votes <- make_vote_information(
+  probability_features = stack_train_features,
+  probability_threshold = paper_probability_threshold,
+  confidence_votes = paper_confidence_votes
+)
+
+paper_validation_votes <- make_vote_information(
+  probability_features = stack_validation_features,
+  probability_threshold = paper_probability_threshold,
+  confidence_votes = paper_confidence_votes
+)
+
+paper_test_votes <- make_vote_information(
+  probability_features = stack_test_features,
+  probability_threshold = paper_probability_threshold,
+  confidence_votes = paper_confidence_votes
+)
+
+c(
+  Ensemble_Size = number_of_base_learners,
+  Required_Agreement = paper_confidence_votes
+)
+
+## ---- Inspect how much data bypasses the meta-learner -----------------------
+
+prefilter_diagnostics <- data.frame(
+  Data_Set = c(
+    "OOF training",
+    "Validation",
+    "Test"
+  ),
+  Observations = c(
+    nrow(stack_train_features),
+    nrow(stack_validation_features),
+    nrow(stack_test_features)
+  ),
+  Direct_Vote_Predictions = c(
+    sum(paper_train_votes$summary$Confident),
+    sum(paper_validation_votes$summary$Confident),
+    sum(paper_test_votes$summary$Confident)
+  )
+)
+
+prefilter_diagnostics$Sent_To_Meta_Learner <-
+  prefilter_diagnostics$Observations -
+  prefilter_diagnostics$Direct_Vote_Predictions
+
+prefilter_diagnostics$Direct_Vote_Rate <- round(
+  prefilter_diagnostics$Direct_Vote_Predictions /
+    prefilter_diagnostics$Observations,
+  digits = 3
+)
+
+prefilter_diagnostics$Meta_Learner_Rate <- round(
+  prefilter_diagnostics$Sent_To_Meta_Learner /
+    prefilter_diagnostics$Observations,
+  digits = 3
+)
+
+prefilter_diagnostics
+
+# This table checks whether high-agreement cases are almost exclusively
+# predictions of the majority class. That would make a high bypass rate less
+# informative on an imbalanced dataset.
+table(
+  Confident = paper_train_votes$summary$Confident,
+  Majority_Label = paper_train_votes$summary$Majority_Label,
+  useNA = "ifany"
+)
+
+## ---- Filter the OOF training cases ------------------------------------
+
+paper_train_difficult <-
+  !paper_train_votes$summary$Confident
+
+paper_validation_difficult <-
+  !paper_validation_votes$summary$Confident
+
+paper_test_difficult <-
+  !paper_test_votes$summary$Confident
+
+paper_filtered_train_features <-
+  stack_train_features[
+    paper_train_difficult,
+    ,
+    drop = FALSE
+  ]
+
+paper_filtered_train_labels <-
+  stack_train_labels[paper_train_difficult]
+
+paper_filtered_validation_features <-
+  stack_validation_features[
+    paper_validation_difficult,
+    ,
+    drop = FALSE
+  ]
+
+paper_filtered_validation_labels <-
+  stack_validation_labels[paper_validation_difficult]
+
+if (nrow(paper_filtered_train_features) < 10L) {
+  stop(
+    paste(
+      "Too few difficult OOF observations remain after pre-filtering.",
+      "Use more base-learner diversity or reconsider the pre-filtering rule."
+    )
+  )
+}
+
+if (length(unique(paper_filtered_train_labels)) < 2L) {
+  stop(
+    paste(
+      "The filtered OOF training set contains only one class.",
+      "The XGBoost meta-learner cannot be trained."
+    )
+  )
+}
+
+data.frame(
+  Filtered_Training_Observations =
+    nrow(paper_filtered_train_features),
+  Negative_Class =
+    sum(paper_filtered_train_labels == 0),
+  Positive_Class =
+    sum(paper_filtered_train_labels == 1)
+)
+
+## ---- Train XGBoost only on difficult OOF cases -----------------------------
+
+paper_positive_weight <-
+  sum(paper_filtered_train_labels == 0) /
+  sum(paper_filtered_train_labels == 1)
+
+paper_dtrain <- xgb.DMatrix(
+  data = as.matrix(
+    paper_filtered_train_features
+  ),
+  label = paper_filtered_train_labels
+)
+
+paper_parameters <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  tree_method = "hist",
+  max_depth = 2,
+  learning_rate = 0.05,
+  min_child_weight = 5,
+  subsample = 0.8,
+  colsample_bytree = 1,
+  reg_lambda = 1,
+  reg_alpha = 0,
+  scale_pos_weight = paper_positive_weight,
+  seed = 900,
+  nthread = n_cores # HABROK: use all cores allocated to this task
+)
+
+set.seed(900)
+
+can_use_filtered_validation <-
+  nrow(paper_filtered_validation_features) >= 10L &&
+  length(unique(paper_filtered_validation_labels)) == 2L
+
+if (can_use_filtered_validation) {
+
+  paper_dvalidation <- xgb.DMatrix(
+    data = as.matrix(
+      paper_filtered_validation_features
+    ),
+    label = paper_filtered_validation_labels
+  )
+
+  paper_meta_model <- xgb.train(
+    params = paper_parameters,
+    data = paper_dtrain,
+    nrounds = 500,
+    evals = list(
+      train = paper_dtrain,
+      validation = paper_dvalidation
+    ),
+    early_stopping_rounds = 30,
+    maximize = TRUE,
+    verbose = 1,
+    print_every_n = 25
+  )
+
+} else {
+
+  warning(
+    paste(
+      "The filtered validation set is too small or contains one class.",
+      "The pre-filtered meta-learner is trained for a fixed 250 rounds."
+    )
+  )
+
+  paper_meta_model <- xgb.train(
+    params = paper_parameters,
+    data = paper_dtrain,
+    nrounds = 250,
+    verbose = 0
+  )
+}
+
+## ---- Select the hybrid meta-learner threshold ------------------------------
+
+paper_validation_meta_prob <- predict(
+  paper_meta_model,
+  dstack_validation
+)
+
+# The threshold is selected using the complete hybrid validation prediction:
+# confident cases use their vote, while difficult cases use the meta-learner.
+paper_meta_threshold <- find_prefilter_threshold(
+  meta_probabilities = paper_validation_meta_prob,
+  vote_information = paper_validation_votes,
+  actual = validation$spam,
+  metric = "Balanced_Accuracy"
+)
+
+paper_meta_threshold
+
+## ---- Evaluate the pre-filtered ensemble ------------------------------------
+
+paper_test_meta_prob <- predict(
+  paper_meta_model,
+  dstack_test
+)
+
+paper_prefilter_pred <- compose_prefilter_predictions(
+  meta_probabilities = paper_test_meta_prob,
+  vote_information = paper_test_votes,
+  meta_threshold = paper_meta_threshold
+)
+
+paper_prefilter_metrics <- evaluate_model(
+  paper_prefilter_pred,
+  test$spam
+)
+
+paper_prefilter_metrics
+
+## ---- Hard-voting reference ---------------------------------------------
+
+hard_vote_pred <- make_hard_vote_predictions(
+  probability_features = stack_test_features,
+  probability_threshold = paper_probability_threshold
+)
+
+hard_vote_metrics <- evaluate_model(
+  hard_vote_pred,
+  test$spam
+)
+
+hard_vote_metrics
+
+## ---- Complete comparison ------------------------------------------------
+
+comparison <- data.frame(
+  Model = c(
+    "Standalone XGBoost",
+    "Hard vote (ties by mean probability)",
+    "Standard stack: XGBoost meta-learner",
+    "Paper-inspired pre-filter + XGBoost meta-learner"
+  ),
+  Threshold = c(
+    xgb_threshold,
+    NA_real_,
+    stack_threshold,
+    paper_meta_threshold
+  ),
+  rbind(
+    xgb_metrics,
+    hard_vote_metrics,
+    stack_metrics,
+    paper_prefilter_metrics
+  )
+)
+
+rownames(comparison) <- NULL
+
+numeric_columns <- sapply(
+  comparison,
+  is.numeric
+)
+
+comparison[numeric_columns] <- round(
+  comparison[numeric_columns],
+  digits = 3
+)
+
+comparison
+
+## ---- Direct comparison with the current standard stack --------------------
+
+prefilter_minus_standard_stack <-
+  paper_prefilter_metrics["Balanced_Accuracy"] -
+  stack_metrics["Balanced_Accuracy"]
+
+prefilter_minus_standalone_xgb <-
+  paper_prefilter_metrics["Balanced_Accuracy"] -
+  xgb_metrics["Balanced_Accuracy"]
+
+if (prefilter_minus_standard_stack > 0) {
+  cat(
+    "The paper-inspired pre-filtered ensemble surpassed the standard stack by",
+    round(prefilter_minus_standard_stack, 3),
+    "in balanced accuracy.\n"
+  )
+} else if (prefilter_minus_standard_stack < 0) {
+  cat(
+    "The paper-inspired pre-filtered ensemble was",
+    round(abs(prefilter_minus_standard_stack), 3),
+    "lower than the standard stack in balanced accuracy.\n"
+  )
+} else {
+  cat(
+    "The paper-inspired pre-filtered ensemble and the standard stack",
+    "had identical balanced accuracy.\n"
+  )
+}
+
+if (prefilter_minus_standalone_xgb > 0) {
+  cat(
+    "It also surpassed standalone XGBoost by",
+    round(prefilter_minus_standalone_xgb, 3),
+    "in balanced accuracy.\n"
+  )
+} else if (prefilter_minus_standalone_xgb < 0) {
+  cat(
+    "It remained",
+    round(abs(prefilter_minus_standalone_xgb), 3),
+    "below standalone XGBoost in balanced accuracy.\n"
+  )
+} else {
+  cat(
+    "It matched standalone XGBoost in balanced accuracy.\n"
+  )
+}
+
+## ---- Save the result for repeated split seeds ------------------------------
+
+ensemble_seed_result <- data.frame(
+  Seed = split_seed,
+  Configuration_ID = configuration_id,
+
+  XGBoost_BA = unname(
+    xgb_metrics["Balanced_Accuracy"]
+  ),
+
+  Hard_Vote_BA = unname(
+    hard_vote_metrics["Balanced_Accuracy"]
+  ),
+
+  Standard_Stack_BA = unname(
+    stack_metrics["Balanced_Accuracy"]
+  ),
+
+  Prefilter_Stack_BA = unname(
+    paper_prefilter_metrics[
+      "Balanced_Accuracy"
+    ]
+  ),
+
+  Prefilter_Minus_Standard = unname(
+    paper_prefilter_metrics[
+      "Balanced_Accuracy"
+    ] -
+      stack_metrics[
+        "Balanced_Accuracy"
+      ]
+  ),
+
+  Prefilter_Minus_XGBoost = unname(
+    paper_prefilter_metrics[
+      "Balanced_Accuracy"
+    ] -
+      xgb_metrics[
+        "Balanced_Accuracy"
+      ]
+  ),
+
+  Direct_Vote_Rate_Test = mean(
+    paper_test_votes$summary$Confident
+  ),
+
+  Test_Cases_Sent_To_Meta = sum(
+    paper_test_difficult
+  ),
+
+  stringsAsFactors = FALSE
+)
+
+# Add all individual base-learner values to the same row
+vote_threshold_result_row <- as.data.frame(
+  as.list(
+    setNames(
+      as.numeric(
+        base_vote_thresholds
+      ),
+      paste0(
+        "Gate_Threshold_",
+        names(base_vote_thresholds)
+      )
+    )
+  ),
+  check.names = FALSE
+)
+
+seed_result <- cbind(
+  ensemble_seed_result,
+  base_learner_result_row,
+  vote_threshold_result_row
+)
+
+# ------------------------------------------------------------
+# Save results in configuration_id.csv
+# HABROK: locked, because multiple SLURM array tasks (one per seed) may
+# write to this same file at the same time.
+# ------------------------------------------------------------
+
+results_directory <- "prefilter_seed_results"
+
+dir.create(
+  results_directory,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+result_filename <- file.path(
+  results_directory,
+  paste0(
+    configuration_id,
+    ".csv"
+  )
+)
+
+combined_results <- with_file_lock(result_filename, {
+
+  if (file.exists(result_filename)) {
+
+    existing_results <- read.csv(
+      result_filename,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+
+    # Remove the old result for the current seed
+    existing_results <- existing_results[
+      existing_results$Seed != split_seed,
+      ,
+      drop = FALSE
+    ]
+
+    # Existing CSV files may not yet contain the new base-learner
+    # columns. Create a common column structure before row-binding.
+    all_result_columns <- union(
+      colnames(existing_results),
+      colnames(seed_result)
+    )
+
+    columns_missing_from_existing <- setdiff(
+      all_result_columns,
+      colnames(existing_results)
+    )
+
+    for (
+      column_name in columns_missing_from_existing
+    ) {
+
+      existing_results[[column_name]] <- rep(
+        NA,
+        nrow(existing_results)
+      )
+    }
+
+    columns_missing_from_new_result <- setdiff(
+      all_result_columns,
+      colnames(seed_result)
+    )
+
+    for (
+      column_name in columns_missing_from_new_result
+    ) {
+
+      seed_result[[column_name]] <- rep(
+        NA,
+        nrow(seed_result)
+      )
+    }
+
+    existing_results <- existing_results[
+      ,
+      all_result_columns,
+      drop = FALSE
+    ]
+
+    seed_result <- seed_result[
+      ,
+      all_result_columns,
+      drop = FALSE
+    ]
+
+    result <- rbind(
+      existing_results,
+      seed_result
+    )
+
+  } else {
+
+    result <- seed_result
+  }
+
+  result <- result[
+    order(result$Seed),
+    ,
+    drop = FALSE
+  ]
+
+  rownames(result) <- NULL
+
+  write.csv(
+    result,
+    file = result_filename,
+    row.names = FALSE
+  )
+
+  result
+})
+
+cat(
+  "\nResults saved to:\n",
+  normalizePath(
+    result_filename,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+combined_results
+
+## ---- Save ensemble comparison plots ---------------------------------------
+
+plot_directory <- file.path(
+  results_directory,
+  "plots",
+  configuration_id
+)
+
+dir.create(
+  plot_directory,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# Plot 1: balanced accuracy across seeds
+
+model_plot_data <- combined_results |>
+  select(
+    Seed,
+    XGBoost_BA,
+    Hard_Vote_BA,
+    Standard_Stack_BA,
+    Prefilter_Stack_BA
+  ) |>
+  pivot_longer(
+    cols = -Seed,
+    names_to = "Model",
+    values_to = "Balanced_Accuracy"
+  ) |>
+  mutate(
+    Model = recode(
+      Model,
+      XGBoost_BA =
+        "Standalone XGBoost",
+      Hard_Vote_BA =
+        "Hard voting",
+      Standard_Stack_BA =
+        "Standard stack",
+      Prefilter_Stack_BA =
+        "Pre-filtered stack"
+    )
+  )
+
+performance_plot <- ggplot(
+  model_plot_data,
+  aes(
+    x = factor(Seed),
+    y = Balanced_Accuracy,
+    group = Model,
+    shape = Model,
+    linetype = Model
+  )
+) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dotted"
+  ) +
+  geom_line(
+    linewidth = 0.7
+  ) +
+  geom_point(
+    size = 2.5
+  ) +
+  labs(
+    title = paste(
+      "Balanced accuracy across seeds:",
+      configuration_id
+    ),
+    subtitle = paste(
+      "The dotted reference line represents",
+      "balanced accuracy = 0.50"
+    ),
+    x = "Split seed",
+    y = "Balanced accuracy",
+    shape = "Method",
+    linetype = "Method"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+performance_plot_filename <- file.path(
+  plot_directory,
+  "01_balanced_accuracy_across_seeds.png"
+)
+
+ggsave(
+  filename = performance_plot_filename,
+  plot = performance_plot,
+  width = 10,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+
+# Plot 2: pre-filtering difference across seeds
+
+difference_plot_data <- combined_results |>
+  select(
+    Seed,
+    Prefilter_Minus_Standard,
+    Prefilter_Minus_XGBoost
+  ) |>
+  pivot_longer(
+    cols = -Seed,
+    names_to = "Comparison",
+    values_to = "Balanced_Accuracy_Difference"
+  ) |>
+  mutate(
+    Comparison = recode(
+      Comparison,
+      Prefilter_Minus_Standard =
+        "Pre-filtered minus standard stack",
+      Prefilter_Minus_XGBoost =
+        "Pre-filtered minus standalone XGBoost"
+    )
+  )
+
+difference_plot <- ggplot(
+  difference_plot_data,
+  aes(
+    x = factor(Seed),
+    y = Balanced_Accuracy_Difference,
+    fill = Comparison
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.7
+  ) +
+  geom_col(
+    position = position_dodge(
+      width = 0.8
+    ),
+    width = 0.7
+  ) +
+  labs(
+    title = "Effect of pre-filtering across seeds",
+    subtitle = paste(
+      "Positive values favour the pre-filtered ensemble;",
+      "negative values favour the comparison method"
+    ),
+    x = "Split seed",
+    y = "Difference in balanced accuracy",
+    fill = "Comparison"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+difference_plot_filename <- file.path(
+  plot_directory,
+  "02_prefilter_performance_difference.png"
+)
+
+ggsave(
+  filename = difference_plot_filename,
+  plot = difference_plot,
+  width = 10,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+
+# Plot 3: test-case routing across seeds
+
+routing_plot_data <- combined_results |>
+  transmute(
+    Seed = factor(Seed),
+    `Direct vote` = Direct_Vote_Rate_Test,
+    `Meta-learner` = 1 - Direct_Vote_Rate_Test
+  ) |>
+  pivot_longer(
+    cols = c(
+      `Direct vote`,
+      `Meta-learner`
+    ),
+    names_to = "Route",
+    values_to = "Proportion"
+  )
+
+routing_plot <- ggplot(
+  routing_plot_data,
+  aes(
+    x = Seed,
+    y = Proportion,
+    fill = Route
+  )
+) +
+  geom_col(
+    width = 0.75
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(
+        Proportion,
+        accuracy = 1
+      )
+    ),
+    position = position_stack(
+      vjust = 0.5
+    ),
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(
+      accuracy = 1
+    ),
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Routing of test observations across seeds",
+    subtitle = paste(
+      "Direct-vote cases bypass XGBoost;",
+      "the remaining cases are sent to the meta-learner"
+    ),
+    x = "Split seed",
+    y = "Percentage of test observations",
+    fill = "Prediction route"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+routing_plot_filename <- file.path(
+  plot_directory,
+  "03_test_case_routing.png"
+)
+
+ggsave(
+  filename = routing_plot_filename,
+  plot = routing_plot,
+  width = 10,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+
+cat(
+  "\nPlots saved to:\n",
+  normalizePath(
+    plot_directory,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+## ---- Diagnose base-learner and pre-filtered-stack performance -------------
+
+diagnostic_results <- with_file_lock(
+  result_filename,
+  read.csv(
+    result_filename,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+)
+
+required_base_metrics <- c(
+  "Threshold",
+  "Accuracy",
+  "Balanced_Accuracy",
+  "Precision",
+  "Recall",
+  "Specificity",
+  "F1"
+)
+
+required_ensemble_columns <- c(
+  "Seed",
+  "Prefilter_Stack_BA",
+  "Standard_Stack_BA",
+  "XGBoost_BA",
+  "Direct_Vote_Rate_Test",
+  "Test_Cases_Sent_To_Meta"
+)
+
+missing_ensemble_columns <- setdiff(
+  required_ensemble_columns,
+  colnames(diagnostic_results)
+)
+
+if (length(missing_ensemble_columns) > 0L) {
+  stop(
+    paste(
+      "The result CSV is missing:",
+      paste(
+        missing_ensemble_columns,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+# Convert wide base-learner columns into a long table
+
+base_learner_long <- diagnostic_results |>
+  select(
+    Seed,
+    starts_with("Base_")
+  ) |>
+  pivot_longer(
+    cols = starts_with("Base_"),
+    names_to = c(
+      "Model",
+      "Metric"
+    ),
+    names_pattern = paste0(
+      "^Base_(.+?)_(",
+      paste(
+        c(
+          "Balanced_Accuracy",
+          "Specificity",
+          "Precision",
+          "Threshold",
+          "Accuracy",
+          "Recall",
+          "F1"
+        ),
+        collapse = "|"
+      ),
+      ")$"
+    ),
+    values_to = "Value"
+  ) |>
+  pivot_wider(
+    names_from = Metric,
+    values_from = Value
+  ) |>
+  arrange(
+    Seed,
+    Model
+  )
+
+# Check that all expected metrics were reconstructed
+missing_reconstructed_metrics <- setdiff(
+  required_base_metrics,
+  colnames(base_learner_long)
+)
+
+if (length(missing_reconstructed_metrics) > 0L) {
+  stop(
+    paste(
+      "Could not reconstruct these base-learner metrics:",
+      paste(
+        missing_reconstructed_metrics,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+# Table 1: average base-learner performance across seeds
+
+base_learner_summary <- base_learner_long |>
+  group_by(Model) |>
+  summarise(
+    Seeds = sum(
+      !is.na(Balanced_Accuracy)
+    ),
+    Mean_BA = mean(
+      Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    SD_BA = sd(
+      Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    Minimum_BA = min(
+      Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    Maximum_BA = max(
+      Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    Mean_Accuracy = mean(
+      Accuracy,
+      na.rm = TRUE
+    ),
+    Mean_Precision = mean(
+      Precision,
+      na.rm = TRUE
+    ),
+    Mean_Recall = mean(
+      Recall,
+      na.rm = TRUE
+    ),
+    Mean_Specificity = mean(
+      Specificity,
+      na.rm = TRUE
+    ),
+    Mean_F1 = mean(
+      F1,
+      na.rm = TRUE
+    ),
+    Mean_Threshold = mean(
+      Threshold,
+      na.rm = TRUE
+    ),
+    SD_Threshold = sd(
+      Threshold,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  arrange(
+    desc(Mean_BA)
+  )
+
+cat("\nAverage base-learner performance across seeds:\n")
+print(
+  base_learner_summary |>
+    mutate(
+      across(
+        where(is.numeric),
+        ~ round(.x, 4)
+      )
+    )
+)
+
+# Table 2: strongest and weakest learner for each seed
+
+base_seed_summary <- base_learner_long |>
+  filter(
+    !is.na(Balanced_Accuracy)
+  ) |>
+  group_by(Seed) |>
+  summarise(
+    Mean_Base_BA = mean(
+      Balanced_Accuracy
+    ),
+    SD_Base_BA = sd(
+      Balanced_Accuracy
+    ),
+    Best_Base_Learner =
+      Model[
+        which.max(
+          Balanced_Accuracy
+        )
+      ],
+    Best_Base_BA = max(
+      Balanced_Accuracy
+    ),
+    Worst_Base_Learner =
+      Model[
+        which.min(
+          Balanced_Accuracy
+        )
+      ],
+    Worst_Base_BA = min(
+      Balanced_Accuracy
+    ),
+    Base_BA_Spread =
+      Best_Base_BA -
+      Worst_Base_BA,
+    Base_Learners_Above_050 = sum(
+      Balanced_Accuracy > 0.50
+    ),
+    .groups = "drop"
+  )
+
+prefilter_seed_summary <- diagnostic_results |>
+  select(
+    Seed,
+    Prefilter_Stack_BA,
+    Standard_Stack_BA,
+    XGBoost_BA,
+    Direct_Vote_Rate_Test,
+    Test_Cases_Sent_To_Meta
+  )
+
+base_learners_beaten <- base_learner_long |>
+  left_join(
+    diagnostic_results |>
+      select(
+        Seed,
+        Prefilter_Stack_BA
+      ),
+    by = "Seed"
+  ) |>
+  group_by(Seed) |>
+  summarise(
+    Base_Learners_Beaten_By_Prefilter = sum(
+      Prefilter_Stack_BA >
+        Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    Base_Learners_Matched_By_Prefilter = sum(
+      Prefilter_Stack_BA ==
+        Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+seed_diagnostics <- prefilter_seed_summary |>
+  left_join(
+    base_seed_summary,
+    by = "Seed"
+  ) |>
+  left_join(
+    base_learners_beaten,
+    by = "Seed"
+  ) |>
+  mutate(
+    Prefilter_Minus_Mean_Base =
+      Prefilter_Stack_BA -
+      Mean_Base_BA,
+    Prefilter_Minus_Best_Base =
+      Prefilter_Stack_BA -
+      Best_Base_BA,
+    Prefilter_Minus_Standard =
+      Prefilter_Stack_BA -
+      Standard_Stack_BA
+  ) |>
+  arrange(Seed)
+
+cat("\nPer-seed comparison of the pre-filtered stack with the individual base learners:\n")
+print(
+  seed_diagnostics |>
+    mutate(
+      across(
+        where(is.numeric),
+        ~ round(.x, 4)
+      )
+    )
+)
+
+# Table 3: which base learner is best most often?
+
+best_base_learner_counts <- base_seed_summary |>
+  count(
+    Best_Base_Learner,
+    name = "Number_Of_Seeds"
+  ) |>
+  mutate(
+    Proportion_Of_Seeds =
+      Number_Of_Seeds /
+      sum(Number_Of_Seeds)
+  ) |>
+  arrange(
+    desc(Number_Of_Seeds),
+    Best_Base_Learner
+  )
+
+cat("\nFrequency with which each base learner achieved the highest balanced accuracy:\n")
+print(
+  best_base_learner_counts |>
+    mutate(
+      Proportion_Of_Seeds = round(
+        Proportion_Of_Seeds,
+        3
+      )
+    )
+)
+
+# Safe correlation function
+
+safe_correlation <- function(x, y) {
+
+  complete_index <- complete.cases(
+    x,
+    y
+  )
+
+  x_complete <- x[complete_index]
+  y_complete <- y[complete_index]
+
+  if (
+    length(x_complete) < 3L ||
+    sd(x_complete) == 0 ||
+    sd(y_complete) == 0
+  ) {
+    return(NA_real_)
+  }
+
+  cor(
+    x_complete,
+    y_complete
+  )
+}
+
+# Table 4: association between each base learner and
+# Prefilter_Stack_BA across seeds
+
+base_prefilter_association <- base_learner_long |>
+  left_join(
+    diagnostic_results |>
+      select(
+        Seed,
+        Prefilter_Stack_BA
+      ),
+    by = "Seed"
+  ) |>
+  group_by(Model) |>
+  summarise(
+    Correlation_With_Prefilter_BA =
+      safe_correlation(
+        Balanced_Accuracy,
+        Prefilter_Stack_BA
+      ),
+    Mean_Base_BA = mean(
+      Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  arrange(
+    desc(
+      Correlation_With_Prefilter_BA
+    )
+  )
+
+cat("\nExploratory correlation between base-learner balanced accuracy and pre-filtered-stack balanced accuracy:\n")
+print(
+  base_prefilter_association |>
+    mutate(
+      across(
+        where(is.numeric),
+        ~ round(.x, 4)
+      )
+    )
+)
+
+# Table 5: relationship between routing and performance
+
+routing_association <- data.frame(
+  Attribute = c(
+    "Direct vote rate",
+    "Cases sent to meta-learner",
+    "Mean base-learner BA",
+    "Best base-learner BA",
+    "Spread between best and worst base learner"
+  ),
+  Correlation_With_Prefilter_BA = c(
+    safe_correlation(
+      seed_diagnostics$Direct_Vote_Rate_Test,
+      seed_diagnostics$Prefilter_Stack_BA
+    ),
+    safe_correlation(
+      seed_diagnostics$Test_Cases_Sent_To_Meta,
+      seed_diagnostics$Prefilter_Stack_BA
+    ),
+    safe_correlation(
+      seed_diagnostics$Mean_Base_BA,
+      seed_diagnostics$Prefilter_Stack_BA
+    ),
+    safe_correlation(
+      seed_diagnostics$Best_Base_BA,
+      seed_diagnostics$Prefilter_Stack_BA
+    ),
+    safe_correlation(
+      seed_diagnostics$Base_BA_Spread,
+      seed_diagnostics$Prefilter_Stack_BA
+    )
+  )
+)
+
+cat("\nExploratory associations with Prefilter_Stack_BA across seeds:\n")
+print(
+  routing_association |>
+    mutate(
+      Correlation_With_Prefilter_BA = round(
+        Correlation_With_Prefilter_BA,
+        4
+      )
+    )
+)
+
+# Table 6: overall diagnostic summary
+
+overall_prefilter_diagnosis <- seed_diagnostics |>
+  summarise(
+    Number_Of_Seeds = n(),
+
+    Mean_Prefilter_BA = mean(
+      Prefilter_Stack_BA,
+      na.rm = TRUE
+    ),
+
+    SD_Prefilter_BA = sd(
+      Prefilter_Stack_BA,
+      na.rm = TRUE
+    ),
+
+    Mean_Of_Mean_Base_BA = mean(
+      Mean_Base_BA,
+      na.rm = TRUE
+    ),
+
+    Mean_Best_Base_BA = mean(
+      Best_Base_BA,
+      na.rm = TRUE
+    ),
+
+    Mean_Prefilter_Minus_Mean_Base = mean(
+      Prefilter_Minus_Mean_Base,
+      na.rm = TRUE
+    ),
+
+    Mean_Prefilter_Minus_Best_Base = mean(
+      Prefilter_Minus_Best_Base,
+      na.rm = TRUE
+    ),
+
+    Seeds_Prefilter_Beats_Mean_Base = sum(
+      Prefilter_Minus_Mean_Base > 0,
+      na.rm = TRUE
+    ),
+
+    Seeds_Prefilter_Beats_Best_Base = sum(
+      Prefilter_Minus_Best_Base > 0,
+      na.rm = TRUE
+    ),
+
+    Seeds_Prefilter_Beats_Standard_Stack = sum(
+      Prefilter_Minus_Standard > 0,
+      na.rm = TRUE
+    ),
+
+    Mean_Base_Learners_Beaten = mean(
+      Base_Learners_Beaten_By_Prefilter,
+      na.rm = TRUE
+    )
+  )
+
+cat("\nOverall diagnosis of Prefilter_Stack_BA:\n")
+print(
+  overall_prefilter_diagnosis |>
+    mutate(
+      across(
+        where(is.numeric),
+        ~ round(.x, 4)
+      )
+    )
+)
+
+# Consistency check: standalone XGBoost versus XGBoost stored as a base learner
+
+if (
+  "Base_XGBoost_Balanced_Accuracy" %in%
+    colnames(diagnostic_results)
+) {
+
+  xgboost_consistency_check <- data.frame(
+    Maximum_Absolute_Difference = max(
+      abs(
+        diagnostic_results$XGBoost_BA -
+          diagnostic_results$
+            Base_XGBoost_Balanced_Accuracy
+      ),
+      na.rm = TRUE
+    )
+  )
+
+  cat("\nConsistency check between standalone XGBoost and XGBoost recorded as a base learner:\n")
+  print(
+    xgboost_consistency_check |>
+      mutate(
+        Maximum_Absolute_Difference = round(
+          Maximum_Absolute_Difference,
+          8
+        )
+      )
+  )
+}
+
+## ---- Save test-level predictions and vote patterns -------------------------
+
+model_names <- colnames(
+  stack_test_features
+)
+
+# Retrieve the validation-selected threshold for each learner
+base_threshold_lookup <- setNames(
+  base_learner_test_results$Threshold,
+  base_learner_test_results$Model
+)
+
+missing_thresholds <- setdiff(
+  model_names,
+  names(base_threshold_lookup)
+)
+
+if (length(missing_thresholds) > 0L) {
+  stop(
+    paste(
+      "Missing validation-selected thresholds for:",
+      paste(
+        missing_thresholds,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+# Base-learner predictions using validation-selected thresholds
+
+base_selected_predictions <- sapply(
+  model_names,
+  function(model_name) {
+
+    as.integer(
+      stack_test_features[[model_name]] >=
+        base_threshold_lookup[[model_name]]
+    )
+  }
+)
+
+colnames(base_selected_predictions) <- paste0(
+  "Prediction_",
+  model_names
+)
+
+base_selected_predictions <- as.data.frame(
+  base_selected_predictions,
+  check.names = FALSE
+)
+
+# Base-learner gate votes using learner-specific OOF thresholds
+
+paper_vote_predictions <- as.data.frame(
+  paper_test_votes$hard_predictions * 1L,
+  check.names = FALSE
+)
+
+colnames(paper_vote_predictions) <- paste0(
+  "GateVoteOOF_",
+  model_names
+)
+
+# Store base-learner probabilities
+
+base_probability_results <- as.data.frame(
+  stack_test_features,
+  check.names = FALSE
+)
+
+colnames(base_probability_results) <- paste0(
+  "Probability_",
+  model_names
+)
+
+# Recover original dataset row numbers
+
+test_row_id <- suppressWarnings(
+  as.integer(
+    rownames(test)
+  )
+)
+
+if (anyNA(test_row_id)) {
+  test_row_id <- seq_len(
+    nrow(test)
+  )
+}
+
+actual_test_class <- as.integer(
+  as.character(
+    test$spam
+  )
+)
+
+# Construct one row per test observation
+
+test_prediction_results <- cbind(
+  data.frame(
+    Seed = split_seed,
+    Configuration_ID = configuration_id,
+    Test_Row_ID = test_row_id,
+    Actual_Class = actual_test_class,
+    stringsAsFactors = FALSE
+  ),
+
+  base_probability_results,
+  base_selected_predictions,
+  paper_vote_predictions,
+
+  data.frame(
+    Positive_Votes =
+      paper_test_votes$summary$Positive_Votes,
+
+    Negative_Votes =
+      paper_test_votes$summary$Negative_Votes,
+
+    Maximum_Votes =
+      paper_test_votes$summary$Maximum_Votes,
+
+    Majority_Label =
+      paper_test_votes$summary$Majority_Label,
+
+    Confident_Vote =
+      paper_test_votes$summary$Confident,
+
+    Prediction_Route = ifelse(
+      paper_test_votes$summary$Confident,
+      "Direct_vote",
+      "Meta_learner"
+    ),
+
+    Paper_Meta_Probability =
+      paper_test_meta_prob,
+
+    Paper_Meta_Only_Prediction = as.integer(
+      paper_test_meta_prob >=
+        paper_meta_threshold
+    ),
+
+    Prefilter_Final_Prediction = as.integer(
+      as.character(
+        paper_prefilter_pred
+      )
+    ),
+
+    Standard_Stack_Probability =
+      stack_prob,
+
+    Standard_Stack_Prediction = as.integer(
+      as.character(
+        stack_pred
+      )
+    ),
+
+    Standalone_XGBoost_Probability =
+      xgb_prob,
+
+    Standalone_XGBoost_Prediction = as.integer(
+      as.character(
+        xgb_pred
+      )
+    ),
+
+    Hard_Vote_Prediction = as.integer(
+      as.character(
+        hard_vote_pred
+      )
+    ),
+
+    stringsAsFactors = FALSE
+  )
+)
+
+# Correctness indicators
+test_prediction_results$Prefilter_Correct <-
+  as.integer(
+    test_prediction_results$
+      Prefilter_Final_Prediction ==
+      test_prediction_results$Actual_Class
+  )
+
+test_prediction_results$Standard_Stack_Correct <-
+  as.integer(
+    test_prediction_results$
+      Standard_Stack_Prediction ==
+      test_prediction_results$Actual_Class
+  )
+
+test_prediction_results$Standalone_XGBoost_Correct <-
+  as.integer(
+    test_prediction_results$
+      Standalone_XGBoost_Prediction ==
+      test_prediction_results$Actual_Class
+  )
+
+test_prediction_results$Hard_Vote_Correct <-
+  as.integer(
+    test_prediction_results$
+      Hard_Vote_Prediction ==
+      test_prediction_results$Actual_Class
+  )
+
+# Helper: replace the current seed and append the new rows
+# HABROK: locked, same reason as the main results CSV above.
+
+replace_seed_and_save <- function(
+    new_results,
+    filename,
+    seed_value) {
+
+  with_file_lock(filename, {
+
+    if (file.exists(filename)) {
+
+      existing_results <- read.csv(
+        filename,
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+
+      existing_results <- existing_results[
+        existing_results$Seed != seed_value,
+        ,
+        drop = FALSE
+      ]
+
+      all_columns <- union(
+        colnames(existing_results),
+        colnames(new_results)
+      )
+
+      for (
+        column_name in setdiff(
+          all_columns,
+          colnames(existing_results)
+        )
+      ) {
+        existing_results[[column_name]] <- NA
+      }
+
+      for (
+        column_name in setdiff(
+          all_columns,
+          colnames(new_results)
+        )
+      ) {
+        new_results[[column_name]] <- NA
+      }
+
+      existing_results <- existing_results[
+        ,
+        all_columns,
+        drop = FALSE
+      ]
+
+      new_results <- new_results[
+        ,
+        all_columns,
+        drop = FALSE
+      ]
+
+      combined_results <- rbind(
+        existing_results,
+        new_results
+      )
+
+    } else {
+
+      combined_results <- new_results
+    }
+
+    combined_results <- combined_results[
+      order(
+        combined_results$Seed
+      ),
+      ,
+      drop = FALSE
+    ]
+
+    rownames(combined_results) <- NULL
+
+    write.csv(
+      combined_results,
+      filename,
+      row.names = FALSE
+    )
+
+    invisible(
+      combined_results
+    )
+  })
+}
+
+# Save observation-level predictions
+
+test_prediction_filename <- file.path(
+  results_directory,
+  paste0(
+    configuration_id,
+    "_test_predictions.csv"
+  )
+)
+
+all_test_prediction_results <- replace_seed_and_save(
+  new_results = test_prediction_results,
+  filename = test_prediction_filename,
+  seed_value = split_seed
+)
+
+# Pairwise prediction-level diversity
+
+base_prediction_matrix <- as.matrix(
+  base_selected_predictions
+)
+
+colnames(base_prediction_matrix) <- model_names
+
+model_pairs <- combn(
+  model_names,
+  2,
+  simplify = FALSE
+)
+
+pairwise_diversity_results <- lapply(
+  model_pairs,
+  function(model_pair) {
+
+    model_1 <- model_pair[1]
+    model_2 <- model_pair[2]
+
+    prediction_1 <-
+      base_prediction_matrix[, model_1]
+
+    prediction_2 <-
+      base_prediction_matrix[, model_2]
+
+    correct_1 <-
+      prediction_1 == actual_test_class
+
+    correct_2 <-
+      prediction_2 == actual_test_class
+
+    both_correct <- sum(
+      correct_1 & correct_2
+    )
+
+    model_1_only_correct <- sum(
+      correct_1 & !correct_2
+    )
+
+    model_2_only_correct <- sum(
+      !correct_1 & correct_2
+    )
+
+    both_wrong <- sum(
+      !correct_1 & !correct_2
+    )
+
+    q_denominator <-
+      both_correct * both_wrong +
+      model_1_only_correct *
+      model_2_only_correct
+
+    q_statistic <- ifelse(
+      q_denominator == 0,
+      NA_real_,
+      (
+        both_correct * both_wrong -
+          model_1_only_correct *
+          model_2_only_correct
+      ) /
+        q_denominator
+    )
+
+    data.frame(
+      Seed = split_seed,
+      Configuration_ID = configuration_id,
+      Model_1 = model_1,
+      Model_2 = model_2,
+
+      Disagreement_Rate = mean(
+        prediction_1 != prediction_2
+      ),
+
+      Double_Fault_Rate = mean(
+        !correct_1 & !correct_2
+      ),
+
+      Both_Correct_Rate = mean(
+        correct_1 & correct_2
+      ),
+
+      Model_1_Only_Correct_Rate = mean(
+        correct_1 & !correct_2
+      ),
+
+      Model_2_Only_Correct_Rate = mean(
+        !correct_1 & correct_2
+      ),
+
+      Q_Statistic = q_statistic,
+
+      stringsAsFactors = FALSE
+    )
+  }
+)
+
+pairwise_diversity_results <- do.call(
+  rbind,
+  pairwise_diversity_results
+)
+
+pairwise_diversity_filename <- file.path(
+  results_directory,
+  paste0(
+    configuration_id,
+    "_pairwise_diversity.csv"
+  )
+)
+
+all_pairwise_diversity_results <-
+  replace_seed_and_save(
+    new_results =
+      pairwise_diversity_results,
+    filename =
+      pairwise_diversity_filename,
+    seed_value =
+      split_seed
+  )
+
+cat(
+  "\nTest-level predictions saved to:\n",
+  normalizePath(
+    test_prediction_filename,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n\nPairwise diversity results saved to:\n",
+  normalizePath(
+    pairwise_diversity_filename,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+pairwise_diversity_results
+
+## ---- Visual diagnostics for base learners and prediction diversity --------
+
+required_objects <- c(
+  "base_learner_long",
+  "seed_diagnostics",
+  "all_pairwise_diversity_results",
+  "all_test_prediction_results"
+)
+
+missing_objects <- required_objects[
+  !vapply(
+    required_objects,
+    exists,
+    logical(1)
+  )
+]
+
+if (length(missing_objects) > 0L) {
+  stop(
+    paste(
+      "Run the preceding diagnostic chunks first. Missing objects:",
+      paste(missing_objects, collapse = ", ")
+    )
+  )
+}
+
+diagnostic_plot_directory <- file.path(
+  results_directory,
+  "plots",
+  configuration_id,
+  "diagnostics"
+)
+
+dir.create(
+  diagnostic_plot_directory,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# Readable model labels
+
+clean_model_name <- function(model_name) {
+
+  recode(
+    model_name,
+    ElasticNet = "Elastic Net",
+    GAM = "GAM",
+    MARS = "MARS",
+    RandomForest = "Random Forest",
+    XGBoost = "XGBoost",
+    SVM = "SVM",
+    .default = model_name
+  )
+}
+
+save_diagnostic_plot <- function(
+    plot_object,
+    filename,
+    width = 10,
+    height = 6) {
+
+  ggsave(
+    filename = file.path(
+      diagnostic_plot_directory,
+      filename
+    ),
+    plot = plot_object,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300
+  )
+}
+
+# Plot 1: distribution of base-learner balanced accuracy
+
+base_plot_data <- base_learner_long |>
+  filter(
+    !is.na(Balanced_Accuracy)
+  ) |>
+  mutate(
+    Model = clean_model_name(Model)
+  )
+
+base_model_order <- base_plot_data |>
+  group_by(Model) |>
+  summarise(
+    Mean_BA = mean(
+      Balanced_Accuracy,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  arrange(Mean_BA) |>
+  pull(Model)
+
+base_plot_data <- base_plot_data |>
+  mutate(
+    Model = factor(
+      Model,
+      levels = base_model_order
+    )
+  )
+
+base_distribution_plot <- ggplot(
+  base_plot_data,
+  aes(
+    x = Model,
+    y = Balanced_Accuracy
+  )
+) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.08,
+    height = 0,
+    size = 2,
+    alpha = 0.75
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 18,
+    size = 3.5
+  ) +
+  coord_flip() +
+  labs(
+    title = "Base-learner performance across seeds",
+    subtitle = paste(
+      "Each circle is one split seed;",
+      "diamonds indicate the mean"
+    ),
+    x = NULL,
+    y = "Balanced accuracy"
+  ) +
+  theme_minimal()
+
+save_diagnostic_plot(
+  base_distribution_plot,
+  "04_base_learner_balanced_accuracy.png"
+)
+
+# Plot 2: base-learner performance heatmap
+
+base_heatmap_plot <- ggplot(
+  base_plot_data,
+  aes(
+    x = factor(Seed),
+    y = Model,
+    fill = Balanced_Accuracy
+  )
+) +
+  geom_tile(
+    linewidth = 0.5
+  ) +
+  geom_text(
+    aes(
+      label = sprintf(
+        "%.3f",
+        Balanced_Accuracy
+      )
+    ),
+    size = 3.2
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0.5,
+    labels = scales::number_format(
+      accuracy = 0.01
+    )
+  ) +
+  labs(
+    title = "Balanced accuracy by learner and split seed",
+    subtitle = paste(
+      "Values above 0.50 indicate performance",
+      "above the balanced no-skill reference"
+    ),
+    x = "Split seed",
+    y = NULL,
+    fill = "Balanced\naccuracy"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+save_diagnostic_plot(
+  base_heatmap_plot,
+  "05_base_learner_seed_heatmap.png"
+)
+
+# Plot 3: pre-filtered stack versus individual learners
+
+prefilter_base_comparison <- seed_diagnostics |>
+  select(
+    Seed,
+    Prefilter_Minus_Mean_Base,
+    Prefilter_Minus_Best_Base
+  ) |>
+  pivot_longer(
+    cols = -Seed,
+    names_to = "Comparison",
+    values_to = "Balanced_Accuracy_Difference"
+  ) |>
+  mutate(
+    Comparison = recode(
+      Comparison,
+      Prefilter_Minus_Mean_Base =
+        "Pre-filtered minus average base learner",
+      Prefilter_Minus_Best_Base =
+        "Pre-filtered minus best base learner"
+    )
+  )
+
+prefilter_base_plot <- ggplot(
+  prefilter_base_comparison,
+  aes(
+    x = factor(Seed),
+    y = Balanced_Accuracy_Difference,
+    fill = Comparison
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.7
+  ) +
+  geom_col(
+    position = position_dodge(
+      width = 0.8
+    ),
+    width = 0.7
+  ) +
+  labs(
+    title = "Does the pre-filtered stack add value?",
+    subtitle = paste(
+      "Positive bars favour the pre-filtered stack;",
+      "negative bars favour the base learners"
+    ),
+    x = "Split seed",
+    y = "Difference in balanced accuracy",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+save_diagnostic_plot(
+  prefilter_base_plot,
+  "06_prefilter_vs_base_learners.png"
+)
+
+# Prepare pairwise diversity summaries
+
+pairwise_summary <- all_pairwise_diversity_results |>
+  filter(
+    Configuration_ID == configuration_id
+  ) |>
+  group_by(
+    Model_1,
+    Model_2
+  ) |>
+  summarise(
+    Mean_Disagreement = mean(
+      Disagreement_Rate,
+      na.rm = TRUE
+    ),
+    Mean_Double_Fault = mean(
+      Double_Fault_Rate,
+      na.rm = TRUE
+    ),
+    Mean_Q = mean(
+      Q_Statistic,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    Model_1 = clean_model_name(Model_1),
+    Model_2 = clean_model_name(Model_2)
+  )
+
+all_base_models <- sort(
+  unique(
+    c(
+      pairwise_summary$Model_1,
+      pairwise_summary$Model_2
+    )
+  )
+)
+
+make_symmetric_pairwise <- function(
+    pairwise_data,
+    value_column) {
+
+  forward <- pairwise_data |>
+    transmute(
+      Model_1,
+      Model_2,
+      Value = .data[[value_column]]
+    )
+
+  reverse <- forward |>
+    transmute(
+      Model_1 = Model_2,
+      Model_2 = Model_1,
+      Value
+    )
+
+  bind_rows(
+    forward,
+    reverse
+  ) |>
+    mutate(
+      Model_1 = factor(
+        Model_1,
+        levels = all_base_models
+      ),
+      Model_2 = factor(
+        Model_2,
+        levels = rev(all_base_models)
+      )
+    )
+}
+
+# Plot 4: pairwise disagreement heatmap
+
+disagreement_heatmap_data <- make_symmetric_pairwise(
+  pairwise_summary,
+  "Mean_Disagreement"
+)
+
+disagreement_heatmap_plot <- ggplot(
+  disagreement_heatmap_data,
+  aes(
+    x = Model_1,
+    y = Model_2,
+    fill = Value
+  )
+) +
+  geom_tile(
+    linewidth = 0.5
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(
+        Value,
+        accuracy = 1
+      )
+    ),
+    size = 3.2
+  ) +
+  scale_fill_gradient(
+    labels = scales::percent_format(
+      accuracy = 1
+    )
+  ) +
+  coord_equal() +
+  labs(
+    title = "How often do the base learners disagree?",
+    subtitle = paste(
+      "Higher disagreement indicates greater prediction diversity,",
+      "but does not by itself imply better performance"
+    ),
+    x = NULL,
+    y = NULL,
+    fill = "Disagreement"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 35,
+      hjust = 1
+    )
+  )
+
+save_diagnostic_plot(
+  disagreement_heatmap_plot,
+  "07_pairwise_disagreement_heatmap.png",
+  width = 9,
+  height = 7
+)
+
+# Plot 5: pairwise double-fault heatmap
+
+double_fault_heatmap_data <- make_symmetric_pairwise(
+  pairwise_summary,
+  "Mean_Double_Fault"
+)
+
+double_fault_heatmap_plot <- ggplot(
+  double_fault_heatmap_data,
+  aes(
+    x = Model_1,
+    y = Model_2,
+    fill = Value
+  )
+) +
+  geom_tile(
+    linewidth = 0.5
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(
+        Value,
+        accuracy = 1
+      )
+    ),
+    size = 3.2
+  ) +
+  scale_fill_gradient(
+    labels = scales::percent_format(
+      accuracy = 1
+    )
+  ) +
+  coord_equal() +
+  labs(
+    title = "How often are two base learners wrong together?",
+    subtitle = paste(
+      "Lower double-fault rates are preferable;",
+      "high values indicate correlated errors"
+    ),
+    x = NULL,
+    y = NULL,
+    fill = "Double-fault\nrate"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 35,
+      hjust = 1
+    )
+  )
+
+save_diagnostic_plot(
+  double_fault_heatmap_plot,
+  "08_pairwise_double_fault_heatmap.png",
+  width = 9,
+  height = 7
+)
+
+# Plot 6: pre-filtered performance by prediction route
+
+route_balanced_accuracy <- function(
+    actual,
+    predicted) {
+
+  actual <- as.integer(actual)
+  predicted <- as.integer(predicted)
+
+  if (
+    !all(c(0, 1) %in% unique(actual))
+  ) {
+    return(NA_real_)
+  }
+
+  recall <- mean(
+    predicted[actual == 1] == 1
+  )
+
+  specificity <- mean(
+    predicted[actual == 0] == 0
+  )
+
+  mean(
+    c(
+      recall,
+      specificity
+    )
+  )
+}
+
+route_performance <- all_test_prediction_results |>
+  filter(
+    Configuration_ID == configuration_id
+  ) |>
+  mutate(
+    Prediction_Route = recode(
+      Prediction_Route,
+      Direct_vote = "Direct vote",
+      Meta_learner = "Meta-learner"
+    )
+  ) |>
+  group_by(
+    Seed,
+    Prediction_Route
+  ) |>
+  summarise(
+    Cases = n(),
+    Balanced_Accuracy = route_balanced_accuracy(
+      Actual_Class,
+      Prefilter_Final_Prediction
+    ),
+    .groups = "drop"
+  )
+
+route_performance_plot <- ggplot(
+  route_performance,
+  aes(
+    x = factor(Seed),
+    y = Balanced_Accuracy,
+    fill = Prediction_Route
+  )
+) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  geom_col(
+    position = position_dodge(
+      width = 0.8
+    ),
+    width = 0.7,
+    na.rm = TRUE
+  ) +
+  geom_text(
+    aes(
+      label = ifelse(
+        is.na(Balanced_Accuracy),
+        paste0(
+          "N/A\nn=",
+          Cases
+        ),
+        paste0(
+          sprintf(
+            "%.3f",
+            Balanced_Accuracy
+          ),
+          "\nn=",
+          Cases
+        )
+      )
+    ),
+    position = position_dodge(
+      width = 0.8
+    ),
+    vjust = -0.25,
+    size = 3,
+    na.rm = FALSE
+  ) +
+  coord_cartesian(
+    ylim = c(0, 1.08)
+  ) +
+  labs(
+    title = "Pre-filtered ensemble performance by prediction route",
+    subtitle = paste(
+      "This separates cases handled directly by voting",
+      "from cases handled by the XGBoost meta-learner"
+    ),
+    x = "Split seed",
+    y = "Balanced accuracy within route",
+    fill = "Prediction route",
+    caption = paste(
+      "N/A indicates that the route contained only one true class,",
+      "so balanced accuracy was not defined."
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+save_diagnostic_plot(
+  route_performance_plot,
+  "09_prefilter_performance_by_route.png"
+)
+
+cat(
+  "\nDiagnostic plots saved to:\n",
+  normalizePath(
+    diagnostic_plot_directory,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+cat("\nDone.\n")
