@@ -2,3 +2,7 @@
 # language bar. Count the analyses as R instead.
 *.Rmd linguist-language=R linguist-detectable=true
 *.rmd linguist-language=R linguist-detectable=true
+
+# A shell script with CRLF endings fails on Linux ("bad interpreter:
+# /bin/bash^M"), so keep LF on checkout regardless of platform.
+*.sh text eol=lf
