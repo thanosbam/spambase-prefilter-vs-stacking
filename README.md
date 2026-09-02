@@ -27,7 +27,7 @@ including the paired tests, are in [Results](#results) below.
 
 | Path | Description |
 |---|---|
-| `prefilter_majority_voting_comparison_spambase.Rmd` | The complete analysis, parameterised for local rendering. |
+| `prefilter_majority_voting_comparison_spambase.Rmd` | The complete analysis — the version to run locally. |
 | `spambase.data` | UCI Spambase: 4601 rows x 58 columns, CSV, no header row. |
 | `spambase.names` | Attribute list defining the exact column order of `spambase.data`. |
 | `spambase.DOCUMENTATION` | UCI dataset writeup: source, collection method, per-attribute statistics. |
@@ -113,14 +113,12 @@ and the project directory are hardcoded to the cluster account, so they will not
 unedited. Most people do not have Hábrók access; the `.Rmd` at the repository root is the version
 to run locally.
 
-What differs between the two is infrastructural only: the seed and configuration ID arrive as
-command-line arguments rather than knitr params, the dataset is read from a fixed cluster path, the
-five out-of-fold folds run in parallel with per-fold thread pinning instead of sequentially, the
-shared per-configuration CSVs are file-locked because concurrent array tasks append to them, and
-results print to the console instead of being knitted. The split, the six base learners and their
-hyperparameters, the per-model-per-fold seeds, the fusion rules, the threshold sweeps and the output
-schema are identical. See [On exact reproducibility](#on-exact-reproducibility) for what the change
-of environment does cost.
+Everything that differs is infrastructural: command-line arguments instead of knitr params, a fixed
+cluster data path, out-of-fold folds run in parallel with thread pinning, file-locked shared CSVs,
+console output instead of knitted tables. The split, the base learners and their hyperparameters,
+the per-model-per-fold seeds, the fusion rules, the threshold sweeps and the output schema are
+identical. See [On exact reproducibility](#on-exact-reproducibility) for what the change of
+environment does cost.
 
 Those per-seed figures are committed as
 `SpambasePrefilter5of6OOFThresholds_70seed_summary.csv` (70 rows — one per seed, with each
